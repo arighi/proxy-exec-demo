@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="570" viewBox="0 115 1400 570" role="img" aria-labelledby="title description">
+  <title id="title">Priority inheritance versus proxy execution</title>
+  <desc id="description">A comparison with high, normal, and low-priority tasks. The normal-priority task can normally preempt the low-priority mutex owner. Priority inheritance donates the high priority to the owner, while proxy execution redirects the blocked task's selected CPU slot to the mutex owner.</desc>
+
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#09101f"/>
+      <stop offset="1" stop-color="#111a30"/>
+    </linearGradient>
+    <marker id="blue-arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#54c7ff"/>
+    </marker>
+    <marker id="red-arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#ff7b88"/>
+    </marker>
+    <style>
+      text { font-family: Arial, Helvetica, sans-serif; }
+      .panel-title { font-size: 27px; font-weight: 700; fill: #f1f5ff; }
+      .task-title { font-size: 20px; font-weight: 700; fill: #f1f5ff; }
+      .task-copy { font-size: 15px; fill: #aebbd2; }
+      .action { font-size: 15px; font-weight: 700; letter-spacing: 0.8px; }
+      .result { font-size: 17px; font-weight: 700; fill: #f1f5ff; }
+      .result-copy { font-size: 14px; fill: #aebbd2; }
+      .transfer { font-size: 17px; fill: #c4cede; }
+    </style>
+  </defs>
+
+  <rect width="1400" height="820" fill="url(#background)"/>
+
+  <!-- Priority inheritance -->
+  <rect x="45" y="140" width="635" height="520" rx="24" fill="#111d34" stroke="#315276" stroke-width="2"/>
+  <text x="362" y="190" text-anchor="middle" class="panel-title">Priority Inheritance</text>
+
+  <rect x="85" y="220" width="210" height="92" rx="15" fill="#173653" stroke="#54c7ff" stroke-width="2"/>
+  <text x="190" y="254" text-anchor="middle" class="task-title">High-priority H</text>
+  <text x="190" y="281" text-anchor="middle" class="task-copy">BLOCKED on mutex</text>
+
+  <rect x="430" y="220" width="210" height="92" rx="15" fill="#29263b" stroke="#b18cff" stroke-width="2"/>
+  <text x="535" y="254" text-anchor="middle" class="task-title">Low-priority L</text>
+  <text x="535" y="281" text-anchor="middle" class="task-copy">MUTEX OWNER</text>
+
+  <path d="M 295 266 L 430 266" stroke="#54c7ff" stroke-width="4" fill="none" marker-end="url(#blue-arrow)"/>
+
+  <rect x="85" y="362" width="210" height="82" rx="15" fill="#34232d" stroke="#ff7b88" stroke-width="2"/>
+  <text x="190" y="393" text-anchor="middle" class="task-title">Normal-priority M</text>
+  <text x="190" y="420" text-anchor="middle" class="task-copy">normally preempts L</text>
+  <path d="M 295 403 C 370 403, 366 329, 428 301" stroke="#ff7b88" stroke-width="3" stroke-dasharray="7 6" fill="none" marker-end="url(#red-arrow)"/>
+
+  <path d="M 535 312 C 535 405, 455 436, 428 475" stroke="#54c7ff" stroke-width="4" fill="none" marker-end="url(#blue-arrow)"/>
+  <rect x="187" y="488" width="350" height="150" rx="17" fill="#29263b" stroke="#b18cff" stroke-width="3"/>
+  <text x="362" y="528" text-anchor="middle" class="result">L runs at H's priority</text>
+  <text x="362" y="558" text-anchor="middle" class="transfer">H transfers its scalar priority</text>
+
+  <!-- Proxy execution -->
+  <rect x="720" y="140" width="635" height="520" rx="24" fill="#111d34" stroke="#315276" stroke-width="2"/>
+  <text x="1037" y="190" text-anchor="middle" class="panel-title">Proxy Execution</text>
+
+  <rect x="760" y="220" width="210" height="92" rx="15" fill="#173653" stroke="#54c7ff" stroke-width="2"/>
+  <text x="865" y="254" text-anchor="middle" class="task-title">High-priority H</text>
+  <text x="865" y="281" text-anchor="middle" class="task-copy">BLOCKED on mutex</text>
+
+  <rect x="1105" y="220" width="210" height="92" rx="15" fill="#29263b" stroke="#b18cff" stroke-width="2"/>
+  <text x="1210" y="254" text-anchor="middle" class="task-title">Low-priority L</text>
+  <text x="1210" y="281" text-anchor="middle" class="task-copy">MUTEX OWNER</text>
+
+  <path d="M 970 266 L 1105 266" stroke="#54c7ff" stroke-width="4" fill="none" marker-end="url(#blue-arrow)"/>
+
+  <rect x="760" y="362" width="210" height="82" rx="15" fill="#34232d" stroke="#ff7b88" stroke-width="2"/>
+  <text x="865" y="393" text-anchor="middle" class="task-title">Normal-priority M</text>
+  <text x="865" y="420" text-anchor="middle" class="task-copy">normally preempts L</text>
+  <path d="M 970 403 C 1045 403, 1041 329, 1103 301" stroke="#ff7b88" stroke-width="3" stroke-dasharray="7 6" fill="none" marker-end="url(#red-arrow)"/>
+
+  <path d="M 1210 312 C 1210 405, 1130 436, 1103 475" stroke="#54c7ff" stroke-width="4" fill="none" marker-end="url(#blue-arrow)"/>
+  <rect x="862" y="488" width="350" height="150" rx="17" fill="#142b43" stroke="#54c7ff" stroke-width="3"/>
+  <text x="1037" y="528" text-anchor="middle" class="result">L runs on H's behalf</text>
+  <text x="1037" y="558" text-anchor="middle" class="transfer">H transfers its entire scheduling context</text>
+
+</svg>
