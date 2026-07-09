@@ -1,99 +1,80 @@
 # proxy-demo
 
-`proxy-demo` is a Linux userspace workload for comparing the normal scheduler
-with a sched_ext scheduler that implements proxy execution. It uses only normal
-threads, CPU affinity, a sparse temporary regular file, and an ordinary
-anonymous pipe; it installs no kernel module and requires no patched application
-ABI.
+## Overview
 
-All workload threads retain the default `SCHED_NORMAL` policy. They are pinned
-to one logical CPU so that the CPU worker can delay the pipe worker even on a
-large machine.
+`proxy-demo` is a Linux userspace scheduler benchmark that simulates locking
+priority inversion issues. It creates three workload threads:
+
+- the **foreground thread**, a periodic frame task that waits on a shared
+  kernel mutex and then reads its payload from a pipe;
+- the **background thread**, which holds that mutex during large sparse-file
+  reads and produces the pipe payload;
+- the **CPU worker thread**, which competes for CPU time at a configurable
+  utilization.
+
+All three use the default `SCHED_NORMAL` policy and run on one logical CPU. The
+program uses standard Linux APIs and requires no kernel module or custom
+application ABI.
 
 ## Build and run
+
+Build the optimized binary because debug builds distort scheduler measurements:
 
 ```console
 cargo build --release
 ./target/release/proxy-demo
-./target/release/proxy-demo --stats-interval 5
 ```
 
-Use `--help` for all controls. The visual dashboard runs at 60 frames per second
-until Escape is pressed or its window is closed. `--cpu` accepts a logical CPU
-in the invoking process's current affinity mask. Without it, the first allowed
-CPU is selected, which also works inside a cpuset or container.
-`--cpu-util PERCENT` controls the CPU worker's duty cycle from 0 to 100; it
-defaults to 100, preserving the always-runnable competing workload.
-`--stats-interval SECONDS` prints frame-latency statistics for each completed
-interval as a compact line, then resets the periodic sample window. Reporting
-happens on a separate thread so terminal formatting and output are not included
-in measured frame latency. After the window closes, the detailed final report
-covers the complete run.
-
-Run the same release binary and arguments once with the target sched_ext
-scheduler disabled and once with it enabled. Compare p95, p99, p99.9, maximum,
-and missed deadlines rather than relying only on the mean. For cleaner results,
-avoid moving unrelated work onto the selected CPU between runs.
-
-## OpenGL visualization
-
-Build in release mode, then record a baseline with proxy execution disabled:
+The dashboard runs until Escape is pressed or its window is closed. Common
+options include:
 
 ```console
-cargo build --release
-./target/release/proxy-demo --label "proxy disabled" --output disabled.csv
+./target/release/proxy-demo --cpu 2 --cpu-util 50 --stats-interval 5
+./target/release/proxy-demo --label "baseline" --output baseline.csv
+./target/release/proxy-demo --label "candidate" \
+  --compare baseline.csv --output candidate.csv
 ```
 
-Enable the target sched_ext scheduler externally and run the same workload with
-the baseline overlaid in gray:
+`--cpu` selects an allowed logical CPU and defaults to the first CPU in the
+process affinity mask. `--cpu-util` sets the CPU worker thread's duty cycle from
+0 to 100 percent and defaults to 100. `--stats-interval` enables periodic
+terminal summaries. Run `proxy-demo --help` for all options.
 
-```console
-./target/release/proxy-demo --label "proxy enabled" \
-  --compare disabled.csv --output enabled.csv
-```
+## How does it work?
 
-The anti-aliased dashboard separates control dependencies from data flow. The
-foreground and background threads converge on the shared mutex, while animated
-particles show their bidirectional relationship. Distinct animations identify
-the periodic high-priority foreground workload, low-priority background
-workload, and always-runnable CPU-pressure competitor. The interactive chart
-shows current latency on a fixed zero-to-deadline scale, with the deadline in
-red and an optional comparison run in gray; hover it for exact values.
-Statistic cards show mean, p50, p90, p95, p99, and maximum latency in
-milliseconds. They refresh every `--stats-interval` seconds, or every second
-when that option is omitted. Header badges report presented and
-completed-workload FPS. When the affinity mask contains another CPU, the
-OpenGL/event thread is moved there so dashboard rendering does not compete with
-workload threads on the measured CPU.
+The foreground and background threads share an open regular file description.
+The background thread repeatedly performs large reads from a sparse file,
+holding the kernel's shared-position mutex (`file->f_pos_lock`) while data is
+copied. When the foreground thread performs a one-byte read through a duplicated
+descriptor, it can block behind the background thread. This creates a kernel
+locking dependency in which the latency-sensitive foreground thread depends on
+the background mutex owner being scheduled promptly.
 
-## Why the shared file and pipe pattern
+After acquiring the mutex, the foreground thread reads a frame payload from an
+anonymous pipe. The background thread writes that payload in nonblocking mode,
+so a full pipe does not put it to sleep outside the mutex workload. Meanwhile,
+the CPU worker thread consumes its configured share of the same CPU and
+competes with the background thread. At 100 percent it remains continuously
+runnable; lower values use a short busy/sleep duty cycle.
 
-Pipe empty/full waits release the pipe's internal mutex before sleeping. They do
-not set the task's `blocked_on` relationship to a unique producer and therefore
-cannot reliably trigger sched_ext proxy execution by themselves.
-
-This demo uses a regular file's shared-position mutex (`file->f_pos_lock`) as a
-pure-userspace-accessible proxy gate. The frame and pipe worker use duplicated
-descriptors for the same open file description. The worker continuously issues
-large reads from a sparse file; the read syscall holds `f_pos_lock` while copying
-the requested range. The default 64 MiB operation is long enough to create a
-preemption window without performing physical storage I/O. When the frame thread
-issues its one-byte read through the other descriptor, it enters the kernel
-mutex slow path behind the worker. The scheduler can then follow the frame's
-`blocked_on -> f_pos_lock -> pipe-worker` chain and proxy-execute the worker.
-
-After passing this gate, every frame still depends on receiving its payload from
-an anonymous pipe. The worker writes the pipe in nonblocking mode so a full pipe
-does not make it sleep outside the mutex workload. A CPU-only thread remains
-runnable on the same CPU throughout. There are no inserted sleeps or non-normal
-scheduling policies. `--lock-bytes` controls the mutex-owner read size; larger
-values make owner preemption more likely but consume more memory bandwidth.
+The sparse file creates the mutex-hold window without physical storage I/O.
+`--lock-bytes` controls the background read size: larger reads generally make
+owner preemption more likely, at the cost of additional memory bandwidth.
 
 ## Measurements
 
-Frame latency is measured from the scheduled absolute release to completion, so
-it includes wakeup delay, the kernel mutex gate, and pipe time. Gate wait covers
-the shared file-position access. Pipe wait is measured immediately before
-draining the per-frame payload until its final byte arrives. All clocks and
-absolute sleeps use `CLOCK_MONOTONIC`. A frame misses its deadline when its
-latency exceeds the configured frame period.
+Frame latency is measured from each absolute scheduled release until the frame
+payload is complete. It includes wakeup delay, time waiting for the shared-file
+mutex, and pipe wait. A frame misses its deadline when this total exceeds the
+configured frame period. Timing and absolute sleeps use `CLOCK_MONOTONIC`.
+
+The final report includes latency percentiles, maximum latency, a histogram,
+mutex and pipe wait summaries, and missed deadlines. Periodic summaries run on
+a separate reporter thread so terminal formatting and output are excluded from
+the measured foreground path. CSV output can be loaded as a dashboard baseline
+with `--compare`.
+
+For meaningful comparisons, run the same release binary and arguments for each
+scheduler or scheduler configuration. Compare tail latency (especially p95,
+p99, p99.9, and maximum) and missed deadlines, and keep unrelated work off the
+selected CPU between runs.
