@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText, Stroke};
-use egui_plot::{HLine, Legend, Line, Plot, PlotPoints};
+use egui_plot::{uniform_grid_spacer, HLine, Legend, Line, Plot, PlotPoints};
 
 use crate::cli::Args;
 use crate::stats::Summary;
@@ -25,9 +25,11 @@ const VIOLET: Color32 = Color32::from_rgb(157, 113, 255);
 const AMBER: Color32 = Color32::from_rgb(255, 187, 82);
 const GREEN: Color32 = Color32::from_rgb(54, 211, 153);
 const RED: Color32 = Color32::from_rgb(251, 103, 117);
+const DEADLINE_THRESHOLD_RATIO: f64 = 0.8;
 
 struct Dashboard {
-    data_flow_until: Instant,
+    lock_request_until: Instant,
+    unlock_until: Instant,
     latencies: VecDeque<Duration>,
     comparison: Vec<Duration>,
     mutex_locked: bool,
@@ -35,17 +37,16 @@ struct Dashboard {
     workload_fps: f64,
     fps_epoch: Instant,
     total_frames: u64,
-    interval_samples: Vec<Duration>,
     displayed_summary: Option<Summary>,
-    metrics_interval: Duration,
-    next_metrics_update: Instant,
+    metrics_interval: Option<Duration>,
 }
 
 impl Dashboard {
-    fn new(comparison: Vec<Duration>, metrics_interval: Duration) -> Self {
+    fn new(comparison: Vec<Duration>, metrics_interval: Option<Duration>) -> Self {
         let now = Instant::now();
         Self {
-            data_flow_until: now,
+            lock_request_until: now,
+            unlock_until: now,
             latencies: VecDeque::with_capacity(180),
             comparison,
             mutex_locked: false,
@@ -53,38 +54,28 @@ impl Dashboard {
             workload_fps: 0.0,
             fps_epoch: now,
             total_frames: 0,
-            interval_samples: Vec::new(),
             displayed_summary: None,
             metrics_interval,
-            next_metrics_update: now + metrics_interval,
         }
     }
 
     fn apply(&mut self, event: VisualEvent) {
         match event {
-            VisualEvent::WaitingForGate => self.mutex_locked = true,
-            VisualEvent::WaitingForPipe => self.mutex_locked = false,
+            VisualEvent::WaitingForGate => {
+                self.mutex_locked = true;
+                self.lock_request_until = Instant::now() + Duration::from_millis(120);
+            }
             VisualEvent::FrameComplete { latency } => {
                 self.mutex_locked = false;
-                self.data_flow_until = Instant::now() + Duration::from_millis(120);
+                self.unlock_until = Instant::now() + Duration::from_millis(120);
                 if self.latencies.len() == 180 {
                     self.latencies.pop_front();
                 }
                 self.latencies.push_back(latency);
-                self.interval_samples.push(latency);
                 self.frames_this_second += 1;
                 self.total_frames += 1;
-
-                let now = Instant::now();
-                if now >= self.next_metrics_update {
-                    self.displayed_summary = Summary::from_samples(&self.interval_samples);
-                    self.interval_samples.clear();
-                    self.next_metrics_update += self.metrics_interval;
-                    while self.next_metrics_update <= now {
-                        self.next_metrics_update += self.metrics_interval;
-                    }
-                }
             }
+            VisualEvent::IntervalSummary { summary } => self.displayed_summary = summary,
         }
 
         let elapsed = self.fps_epoch.elapsed();
@@ -95,8 +86,12 @@ impl Dashboard {
         }
     }
 
-    fn data_flow_active(&self) -> bool {
-        Instant::now() < self.data_flow_until
+    fn lock_request_active(&self) -> bool {
+        Instant::now() < self.lock_request_until
+    }
+
+    fn unlock_active(&self) -> bool {
+        Instant::now() < self.unlock_until
     }
 }
 
@@ -162,13 +157,13 @@ impl VisualApp {
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(
-                    RichText::new("PROXY EXECUTION LAB")
+                    RichText::new("SCHEDULER LOCKING LAB")
                         .size(13.0)
                         .color(CYAN)
                         .strong(),
                 );
                 ui.label(
-                    RichText::new("Scheduler latency visualizer")
+                    RichText::new("Latency visualizer")
                         .size(28.0)
                         .color(TEXT)
                         .strong(),
@@ -194,13 +189,13 @@ impl VisualApp {
                     .strong(),
             );
             ui.label(
-                RichText::new("FILE LOCK CONTROLS ORDER  ·  PIPE CARRIES DATA")
+                RichText::new("SHARED FILE LOCK CREATES PRIORITY INVERSION")
                     .size(13.0)
                     .color(MUTED),
             );
         });
         ui.add_space(8.0);
-        flow_diagram(ui, &self.dashboard);
+        flow_diagram(ui, &self.dashboard, self.period);
     }
 
     fn draw_statistics(&self, ui: &mut egui::Ui) {
@@ -211,14 +206,12 @@ impl VisualApp {
                     .color(TEXT)
                     .strong(),
             );
-            ui.label(
-                RichText::new(format!(
-                    "updated every {}",
-                    format_duration(self.dashboard.metrics_interval)
-                ))
-                .size(13.0)
-                .color(MUTED),
-            );
+            let update_text = self
+                .dashboard
+                .metrics_interval
+                .map(|interval| format!("updated every {}", format_duration(interval)))
+                .unwrap_or_else(|| "periodic updates disabled".to_owned());
+            ui.label(RichText::new(update_text).size(13.0).color(MUTED));
         });
         ui.add_space(8.0);
         ui.columns(6, |columns| {
@@ -244,6 +237,7 @@ impl VisualApp {
     fn draw_plot(&self, ui: &mut egui::Ui) {
         modern_panel(ui, |ui| {
             let deadline_ms = self.period.as_secs_f64() * 1000.0;
+            let deadline_threshold_ms = deadline_ms * DEADLINE_THRESHOLD_RATIO;
 
             ui.horizontal(|ui| {
                 ui.label(
@@ -288,6 +282,13 @@ impl VisualApp {
                 .allow_scroll(false)
                 .show_x(false)
                 .y_axis_label("Latency (ms)")
+                .y_grid_spacer(uniform_grid_spacer(move |_| {
+                    [
+                        deadline_threshold_ms / 10.0,
+                        deadline_threshold_ms / 2.0,
+                        deadline_threshold_ms,
+                    ]
+                }))
                 .legend(Legend::default())
                 .show(ui, |plot_ui| {
                     plot_ui.set_plot_bounds_y(0.0..=deadline_ms);
@@ -304,6 +305,11 @@ impl VisualApp {
                             .width(2.5)
                             .fill(0.0)
                             .fill_alpha(0.08),
+                    );
+                    plot_ui.hline(
+                        HLine::new("80% deadline", deadline_threshold_ms)
+                            .color(AMBER)
+                            .width(1.5),
                     );
                     plot_ui.hline(HLine::new("Deadline", deadline_ms).color(RED).width(1.5));
                 });
@@ -386,12 +392,10 @@ pub fn run(args: &Args) -> Result<RunResult, Box<dyn Error>> {
     });
     let _visual_cpu = workload::pin_current_thread_away_from(workload_cpu)?;
 
-    let dashboard = Dashboard::new(
-        comparison,
-        Duration::from_secs(args.stats_interval.unwrap_or(1)),
-    );
+    let metrics_interval =
+        (args.stats_interval != 0).then(|| Duration::from_secs(args.stats_interval));
+    let dashboard = Dashboard::new(comparison, metrics_interval);
     let period = Duration::from_nanos(1_000_000_000_u64 / args.fps as u64);
-    let title = format!("proxy-demo · {}", args.label);
     let app_stop = Arc::clone(&stop);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -402,7 +406,7 @@ pub fn run(args: &Args) -> Result<RunResult, Box<dyn Error>> {
     };
 
     let visual_result = eframe::run_native(
-        &title,
+        "proxy-demo",
         options,
         Box::new(move |creation| {
             Ok(Box::new(VisualApp::new(
@@ -448,9 +452,9 @@ fn modern_panel(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
         .show(ui, content);
 }
 
-fn flow_diagram(ui: &mut egui::Ui, dashboard: &Dashboard) {
+fn flow_diagram(ui: &mut egui::Ui, dashboard: &Dashboard, deadline: Duration) {
     let (canvas, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 190.0),
+        egui::vec2(ui.available_width(), 222.0),
         egui::Sense::hover(),
     );
     let painter = ui.painter_at(canvas);
@@ -474,6 +478,18 @@ fn flow_diagram(ui: &mut egui::Ui, dashboard: &Dashboard) {
         .collect();
 
     let time = ui.input(|input| input.time) as f32;
+
+    let shared_file_rect = egui::Rect::from_min_size(
+        egui::pos2(nodes[1].left(), nodes[1].bottom() + 16.0),
+        nodes[1].size(),
+    );
+    let file_connection_start = nodes[1].center_bottom();
+    let file_connection_end = shared_file_rect.center_top();
+    painter.line_segment(
+        [file_connection_start, file_connection_end],
+        Stroke::new(3.0, AMBER.gamma_multiply(0.65)),
+    );
+    arrow_down(&painter, file_connection_end, AMBER.gamma_multiply(0.65));
 
     let cpu_rect = egui::Rect::from_min_size(
         egui::pos2(nodes[1].left(), canvas.top() + 2.0),
@@ -507,48 +523,32 @@ fn flow_diagram(ui: &mut egui::Ui, dashboard: &Dashboard) {
     );
     let frame_read_start = egui::pos2(nodes[0].right() + 7.0, nodes[0].center().y);
     let frame_read_end = egui::pos2(nodes[1].left() - 10.0, nodes[1].center().y);
-    painter.line_segment([frame_read_start, frame_read_end], Stroke::new(2.0, BORDER));
-    arrow_right(&painter, frame_read_end, BORDER);
-
     let worker_read_start = egui::pos2(nodes[2].left() - 7.0, nodes[2].center().y);
     let worker_read_end = egui::pos2(nodes[1].right() + 10.0, nodes[1].center().y);
-    painter.line_segment(
-        [worker_read_start, worker_read_end],
-        Stroke::new(2.0, BORDER),
-    );
-    arrow_left(&painter, worker_read_end, BORDER);
-
-    let pipe_y = canvas.bottom() - 20.0;
-    let pipe_points = [
-        egui::pos2(nodes[2].center().x, nodes[2].bottom() + 4.0),
-        egui::pos2(nodes[2].center().x, pipe_y),
-        egui::pos2(nodes[0].center().x, pipe_y),
-        egui::pos2(nodes[0].center().x, nodes[0].bottom() + 4.0),
-    ];
-    let data_active = dashboard.data_flow_active();
-    let pipe_color = if data_active {
+    let request_active = dashboard.lock_request_active();
+    let connection_color = if request_active {
         VIOLET
     } else {
         Color32::from_rgb(54, 62, 84)
     };
-    for segment in pipe_points.windows(2) {
-        painter.line_segment([segment[0], segment[1]], Stroke::new(3.0, pipe_color));
-    }
-    arrow_up(&painter, pipe_points[0], pipe_color);
-    arrow_up(&painter, pipe_points[3], pipe_color);
-    if data_active {
-        for index in 0..6 {
-            let progress = (time * 0.9 + index as f32 / 3.0).fract();
-            let progress = if index % 2 == 0 {
-                progress
-            } else {
-                1.0 - progress
-            };
-            let position = point_on_path(&pipe_points, progress);
-            painter.circle_filled(position, 4.0, VIOLET);
-            painter.circle_filled(position, 1.7, TEXT);
-        }
-    }
+    draw_lock_request(
+        &painter,
+        frame_read_start,
+        frame_read_end,
+        connection_color,
+        request_active,
+        time,
+    );
+    arrow_right(&painter, frame_read_end, connection_color);
+    draw_lock_request(
+        &painter,
+        worker_read_start,
+        worker_read_end,
+        connection_color,
+        request_active,
+        time,
+    );
+    arrow_left(&painter, worker_read_end, connection_color);
 
     draw_flow_node(
         &painter,
@@ -559,6 +559,19 @@ fn flow_diagram(ui: &mut egui::Ui, dashboard: &Dashboard) {
     );
     draw_periodic_pulse(&painter, nodes[0], time);
     draw_mutex_node(&painter, nodes[1], dashboard.mutex_locked);
+    draw_flow_node(&painter, shared_file_rect, "Shared File", None, GREEN);
+    draw_shared_file_io(&painter, shared_file_rect, time);
+    let unlock_color = dashboard
+        .displayed_summary
+        .map(|summary| deadline_ring_color(Duration::from_nanos(summary.p99), deadline))
+        .unwrap_or(AMBER);
+    draw_unlock_ring(
+        &painter,
+        nodes[1],
+        dashboard.unlock_active(),
+        time,
+        unlock_color,
+    );
     draw_flow_node(
         &painter,
         nodes[2],
@@ -596,15 +609,18 @@ fn draw_flow_node(
     let fill = Color32::from_rgb(22, 30, 49);
     painter.rect_filled(rect, 14.0, border);
     painter.rect_filled(rect.shrink(1.5), 12.5, fill);
-    painter.circle_filled(egui::pos2(rect.left() + 20.0, rect.center().y), 5.0, accent);
-    let title_y = if subtitle.is_some() {
-        rect.center().y - 8.0
+    let (title_position, title_alignment) = if subtitle.is_some() {
+        painter.circle_filled(egui::pos2(rect.left() + 20.0, rect.center().y), 5.0, accent);
+        (
+            egui::pos2(rect.left() + 34.0, rect.center().y - 8.0),
+            egui::Align2::LEFT_CENTER,
+        )
     } else {
-        rect.center().y
+        (rect.center(), egui::Align2::CENTER_CENTER)
     };
     painter.text(
-        egui::pos2(rect.left() + 34.0, title_y),
-        egui::Align2::LEFT_CENTER,
+        title_position,
+        title_alignment,
         title,
         egui::FontId::proportional(17.0),
         TEXT,
@@ -620,8 +636,13 @@ fn draw_flow_node(
     }
 }
 
-fn draw_mutex_node(painter: &egui::Painter, rect: egui::Rect, locked: bool) {
-    painter.rect_filled(rect, 14.0, AMBER.gamma_multiply(0.65));
+fn draw_mutex_node(painter: &egui::Painter, rect: egui::Rect, contended: bool) {
+    let border = if contended {
+        AMBER
+    } else {
+        AMBER.gamma_multiply(0.65)
+    };
+    painter.rect_filled(rect, 14.0, border);
     painter.rect_filled(rect.shrink(1.5), 12.5, Color32::from_rgb(22, 30, 49));
     painter.text(
         rect.center(),
@@ -633,7 +654,7 @@ fn draw_mutex_node(painter: &egui::Painter, rect: egui::Rect, locked: bool) {
     painter.text(
         egui::pos2(rect.right() - 10.0, rect.bottom() - 7.0),
         egui::Align2::RIGHT_BOTTOM,
-        if locked { "LOCKED" } else { "UNLOCKED" },
+        if contended { "LOCKED" } else { "UNLOCKED" },
         egui::FontId::proportional(9.0),
         AMBER,
     );
@@ -668,6 +689,79 @@ fn draw_background_io(painter: &egui::Painter, rect: egui::Rect, time: f32) {
     }
 }
 
+fn draw_shared_file_io(painter: &egui::Painter, rect: egui::Rect, time: f32) {
+    let track_start = egui::pos2(rect.left() + 12.0, rect.bottom() - 10.0);
+    let track_end = egui::pos2(rect.right() - 12.0, track_start.y);
+    painter.line_segment(
+        [track_start, track_end],
+        Stroke::new(1.0, MUTED.gamma_multiply(0.25)),
+    );
+
+    for (index, offset) in [0.0, 0.25, 0.5, 0.75].into_iter().enumerate() {
+        let progress = (time * 0.55 + offset).fract();
+        let center = if index % 2 == 0 {
+            lerp(track_start, track_end, progress)
+        } else {
+            lerp(track_end, track_start, progress)
+        };
+        let block_size = match index {
+            0 => egui::vec2(8.0, 5.0),
+            1 => egui::vec2(14.0, 6.0),
+            2 => egui::vec2(10.0, 7.0),
+            _ => egui::vec2(18.0, 5.0),
+        };
+        let block = egui::Rect::from_center_size(center, block_size);
+        painter.rect_filled(block, 0.5, GREEN.gamma_multiply(0.7 + progress * 0.3));
+    }
+}
+
+fn draw_lock_request(
+    painter: &egui::Painter,
+    start: egui::Pos2,
+    end: egui::Pos2,
+    color: Color32,
+    active: bool,
+    time: f32,
+) {
+    painter.line_segment([start, end], Stroke::new(3.0, color));
+    if active {
+        let head = (time * 1.4).fract();
+        let tail = (head - 0.28).max(0.0);
+        let pulse = [lerp(start, end, tail), lerp(start, end, head)];
+        painter.line_segment(pulse, Stroke::new(9.0, VIOLET.gamma_multiply(0.18)));
+        painter.line_segment(pulse, Stroke::new(3.5, VIOLET));
+    }
+}
+
+fn draw_unlock_ring(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    active: bool,
+    time: f32,
+    color: Color32,
+) {
+    if !active {
+        return;
+    }
+
+    let phase = (time * 2.0).fract();
+    painter.circle_stroke(
+        rect.center(),
+        rect.height() * 0.5 + 2.0 + phase * 8.0,
+        Stroke::new(2.0, color.gamma_multiply(1.0 - phase)),
+    );
+}
+
+fn deadline_ring_color(p99_latency: Duration, deadline: Duration) -> Color32 {
+    if p99_latency > deadline {
+        RED
+    } else if p99_latency.as_nanos().saturating_mul(5) >= deadline.as_nanos().saturating_mul(4) {
+        AMBER
+    } else {
+        GREEN
+    }
+}
+
 fn arrow_right(painter: &egui::Painter, tip: egui::Pos2, color: Color32) {
     painter.add(egui::Shape::convex_polygon(
         vec![
@@ -688,9 +782,13 @@ fn arrow_left(painter: &egui::Painter, tip: egui::Pos2, color: Color32) {
     ));
 }
 
-fn arrow_up(painter: &egui::Painter, tip: egui::Pos2, color: Color32) {
+fn arrow_down(painter: &egui::Painter, tip: egui::Pos2, color: Color32) {
     painter.add(egui::Shape::convex_polygon(
-        vec![tip, tip + egui::vec2(-5.0, 8.0), tip + egui::vec2(5.0, 8.0)],
+        vec![
+            tip,
+            tip + egui::vec2(-5.0, -8.0),
+            tip + egui::vec2(5.0, -8.0),
+        ],
         color,
         Stroke::NONE,
     ));
@@ -698,22 +796,6 @@ fn arrow_up(painter: &egui::Painter, tip: egui::Pos2, color: Color32) {
 
 fn lerp(start: egui::Pos2, end: egui::Pos2, progress: f32) -> egui::Pos2 {
     start + (end - start) * progress
-}
-
-fn point_on_path(points: &[egui::Pos2], progress: f32) -> egui::Pos2 {
-    let total: f32 = points
-        .windows(2)
-        .map(|pair| pair[0].distance(pair[1]))
-        .sum();
-    let mut remaining = total * progress;
-    for pair in points.windows(2) {
-        let length = pair[0].distance(pair[1]);
-        if remaining <= length {
-            return lerp(pair[0], pair[1], remaining / length.max(f32::EPSILON));
-        }
-        remaining -= length;
-    }
-    *points.last().expect("flow path is non-empty")
 }
 
 fn stat_card(ui: &mut egui::Ui, label: &str, value_ns: Option<f64>) {
@@ -773,4 +855,28 @@ fn load_comparison(path: &std::path::Path) -> Result<Vec<Duration>, Box<dyn Erro
             Ok(Duration::from_nanos(latency))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deadline_ring_color_tracks_p99_proximity() {
+        let deadline = Duration::from_millis(10);
+
+        assert_eq!(
+            deadline_ring_color(Duration::from_millis(7), deadline),
+            GREEN
+        );
+        assert_eq!(
+            deadline_ring_color(Duration::from_millis(8), deadline),
+            AMBER
+        );
+        assert_eq!(deadline_ring_color(deadline, deadline), AMBER);
+        assert_eq!(
+            deadline_ring_color(Duration::from_millis(11), deadline),
+            RED
+        );
+    }
 }

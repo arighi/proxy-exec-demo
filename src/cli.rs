@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-/// Exercise a proxy-executable kernel mutex dependency and a pipe data path.
+/// Exercise a kernel mutex dependency under competing CPU load.
 #[derive(Clone, Debug, Parser)]
 #[command(version, about, long_about = None)]
 pub struct Args {
@@ -20,26 +20,15 @@ pub struct Args {
     #[arg(long, value_name = "PERCENT", default_value_t = 100)]
     pub cpu_util: u8,
 
-    /// Number of bytes that must be read from the pipe to finish each frame.
-    #[arg(long, default_value_t = 64)]
-    pub frame_bytes: usize,
-
-    /// Size of each individual pipe read/write operation.
-    #[arg(long, default_value_t = 64)]
-    pub chunk_bytes: usize,
-
     /// Size of each worker read performed while holding the kernel's shared
     /// file-position mutex.
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
     pub lock_bytes: usize,
 
-    /// Print and reset runtime statistics at this interval, in seconds.
-    #[arg(long, value_name = "SECONDS")]
-    pub stats_interval: Option<u64>,
-
-    /// Label shown by the visualization (for example, "proxy disabled").
-    #[arg(long, default_value = "current scheduler")]
-    pub label: String,
+    /// Print and reset runtime statistics at this interval, in seconds. Use 0
+    /// to disable periodic terminal statistics.
+    #[arg(long, value_name = "SECONDS", default_value_t = 1)]
+    pub stats_interval: u64,
 
     /// Save per-frame measurements as CSV after the run.
     #[arg(long, value_name = "PATH")]
@@ -58,17 +47,8 @@ impl Args {
         if self.cpu_util > 100 {
             return Err("--cpu-util must be between 0 and 100".into());
         }
-        if self.frame_bytes == 0 {
-            return Err("--frame-bytes must be greater than zero".into());
-        }
-        if self.chunk_bytes == 0 {
-            return Err("--chunk-bytes must be greater than zero".into());
-        }
         if self.lock_bytes == 0 {
             return Err("--lock-bytes must be greater than zero".into());
-        }
-        if self.stats_interval == Some(0) {
-            return Err("--stats-interval must be greater than zero".into());
         }
         Ok(())
     }
@@ -101,5 +81,15 @@ mod tests {
             args.validate().unwrap_err().to_string(),
             "--cpu-util must be between 0 and 100"
         );
+    }
+
+    #[test]
+    fn stats_interval_defaults_to_one_and_accepts_zero() {
+        let default_args = Args::try_parse_from(["proxy-demo"]).unwrap();
+        let disabled_args = Args::try_parse_from(["proxy-demo", "--stats-interval", "0"]).unwrap();
+
+        assert_eq!(default_args.stats_interval, 1);
+        assert_eq!(disabled_args.stats_interval, 0);
+        assert!(disabled_args.validate().is_ok());
     }
 }

@@ -2,13 +2,11 @@ use std::time::Duration;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Summary {
-    pub(crate) min: u64,
     pub(crate) average: f64,
     pub(crate) median: u64,
     pub(crate) p90: u64,
     pub(crate) p95: u64,
     pub(crate) p99: u64,
-    pub(crate) p999: u64,
     pub(crate) max: u64,
 }
 
@@ -26,20 +24,18 @@ impl Summary {
         let total: u128 = values.iter().map(|&value| value as u128).sum();
 
         Some(Self {
-            min: values[0],
             average: total as f64 / values.len() as f64,
             median: percentile(&values, 0.5),
             p90: percentile(&values, 0.9),
             p95: percentile(&values, 0.95),
             p99: percentile(&values, 0.99),
-            p999: percentile(&values, 0.999),
             max: *values.last().expect("non-empty samples"),
         })
     }
 }
 
-pub fn print_compact_summary(samples: &[Duration]) {
-    let Some(summary) = Summary::from_samples(samples) else {
+pub(crate) fn print_compact_summary(summary: Option<Summary>) {
+    let Some(summary) = summary else {
         println!("no data");
         return;
     };
@@ -69,12 +65,11 @@ pub fn print_summary(title: &str, samples: &[Duration]) {
         return;
     };
 
-    println!("  minimum: {}", format_ns(summary.min as f64));
-    println!("  average: {}", format_ns(summary.average));
-    println!("  median:  {}", format_ns(summary.median as f64));
+    println!("  mean:    {}", format_ns(summary.average));
+    println!("  p50:     {}", format_ns(summary.median as f64));
+    println!("  p90:     {}", format_ns(summary.p90 as f64));
     println!("  p95:     {}", format_ns(summary.p95 as f64));
     println!("  p99:     {}", format_ns(summary.p99 as f64));
-    println!("  p99.9:   {}", format_ns(summary.p999 as f64));
     println!("  maximum: {}", format_ns(summary.max as f64));
 }
 
@@ -143,8 +138,7 @@ mod tests {
     #[test]
     fn summary_handles_one_sample() {
         let summary = Summary::from_samples(&[Duration::from_nanos(42)]).unwrap();
-        assert_eq!(summary.min, 42);
-        assert_eq!(summary.p999, 42);
+        assert_eq!(summary.median, 42);
         assert_eq!(summary.max, 42);
     }
 }

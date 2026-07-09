@@ -1,17 +1,15 @@
 use std::error::Error;
 use std::fs::{self, File, OpenOptions};
 use std::hint::black_box;
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::fd::OwnedFd;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::sched::{sched_getaffinity, sched_setaffinity, CpuSet};
-use nix::unistd::{pipe, Pid};
+use nix::unistd::Pid;
 
 use crate::cli::Args;
 use crate::stats;
@@ -21,14 +19,12 @@ pub struct RunResult {
     pub cpu: usize,
     pub frame_period: Duration,
     pub frame_latencies: Vec<Duration>,
-    pub pipe_waits: Vec<Duration>,
     pub gate_waits: Vec<Duration>,
     pub deadline_misses: usize,
 }
 
 struct FrameResult {
     frame_latencies: Vec<Duration>,
-    pipe_waits: Vec<Duration>,
     gate_waits: Vec<Duration>,
     deadline_misses: usize,
 }
@@ -40,8 +36,8 @@ struct FrameSample {
 #[derive(Clone, Copy, Debug)]
 pub enum VisualEvent {
     WaitingForGate,
-    WaitingForPipe,
     FrameComplete { latency: Duration },
+    IntervalSummary { summary: Option<stats::Summary> },
 }
 
 pub fn run_visual(
@@ -60,35 +56,34 @@ fn run_inner(
     let cpu = select_cpu(args.cpu)?;
     let period_ns = 1_000_000_000_u64 / args.fps as u64;
 
-    let (read_fd, write_fd) = pipe()?;
-    set_nonblocking(&write_fd)?;
     let (frame_gate, worker_gate) = create_gate_file(args.lock_bytes)?;
     let start = Arc::new(Barrier::new(3));
-    let (sample_tx, reporter) = if let Some(interval) = args.stats_interval {
+    let (sample_tx, reporter) = if args.stats_interval != 0 {
+        let interval = args.stats_interval;
         let (tx, rx) = mpsc::channel();
+        let reporter_visual_tx = visual_tx.clone();
         let reporter = thread::Builder::new()
             .name("stats-reporter".into())
-            .spawn(move || report_periodically(rx, Duration::from_secs(interval)))?;
+            .spawn(move || {
+                report_periodically(rx, Duration::from_secs(interval), reporter_visual_tx)
+            })?;
         (Some(tx), Some(reporter))
     } else {
         (None, None)
     };
 
-    let producer_stop = Arc::clone(&stop);
-    let producer_start = Arc::clone(&start);
-    let chunk_bytes = args.chunk_bytes;
+    let background_stop = Arc::clone(&stop);
+    let background_start = Arc::clone(&start);
     let lock_bytes = args.lock_bytes;
-    let producer = thread::Builder::new()
-        .name("pipe-worker".into())
+    let background = thread::Builder::new()
+        .name("background".into())
         .spawn(move || {
-            pipe_worker(
-                write_fd,
+            background_worker(
                 worker_gate,
                 cpu,
-                chunk_bytes,
                 lock_bytes,
-                producer_stop,
-                producer_start,
+                background_stop,
+                background_start,
             )
         })?;
 
@@ -101,15 +96,10 @@ fn run_inner(
 
     let frame_stop = Arc::clone(&stop);
     let frame_start = Arc::clone(&start);
-    let frame_bytes = args.frame_bytes;
-    let frame_chunk_bytes = args.chunk_bytes;
     let frame = thread::Builder::new().name("frame".into()).spawn(move || {
         frame_loop(
-            read_fd,
             frame_gate,
             cpu,
-            frame_bytes,
-            frame_chunk_bytes,
             period_ns,
             frame_stop,
             frame_start,
@@ -120,19 +110,18 @@ fn run_inner(
 
     let frame_result = join_named(frame, "frame")?;
     stop.store(true, Ordering::Release);
-    let producer_result = join_named(producer, "pipe worker")?;
+    let background_result = join_named(background, "background worker")?;
     join_named(cpu_worker, "CPU worker")?;
     if let Some(reporter) = reporter {
         join_named(reporter, "stats reporter")?;
     }
-    producer_result?;
+    background_result?;
     let frame_result = frame_result?;
 
     Ok(RunResult {
         cpu,
         frame_period: ns_to_duration(period_ns),
         frame_latencies: frame_result.frame_latencies,
-        pipe_waits: frame_result.pipe_waits,
         gate_waits: frame_result.gate_waits,
         deadline_misses: frame_result.deadline_misses,
     })
@@ -172,14 +161,6 @@ fn pin_current_thread(cpu: usize) -> io::Result<()> {
     sched_setaffinity(Pid::from_raw(0), &set).map_err(io::Error::from)
 }
 
-fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
-    let flags = fcntl(fd, FcntlArg::F_GETFL).map_err(io::Error::from)?;
-    let flags = OFlag::from_bits_truncate(flags);
-    fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
-        .map(|_| ())
-        .map_err(io::Error::from)
-}
-
 fn create_gate_file(lock_bytes: usize) -> io::Result<(File, File)> {
     let mut path = std::env::temp_dir();
     path.push(format!(
@@ -212,18 +193,14 @@ fn create_gate_file(lock_bytes: usize) -> io::Result<(File, File)> {
     Ok((file, worker))
 }
 
-fn pipe_worker(
-    write_fd: OwnedFd,
+fn background_worker(
     mut gate: File,
     cpu: usize,
-    chunk_bytes: usize,
     lock_bytes: usize,
     stop: Arc<AtomicBool>,
     start: Arc<Barrier>,
 ) -> io::Result<()> {
     let affinity_result = pin_current_thread(cpu);
-    let mut pipe = File::from(write_fd);
-    let payload = vec![0xa5; chunk_bytes];
     let mut gate_buffer = vec![0_u8; lock_bytes];
     start.wait();
     affinity_result?;
@@ -231,28 +208,14 @@ fn pipe_worker(
     while !stop.load(Ordering::Acquire) {
         if gate.read(&mut gate_buffer)? == 0 {
             gate.seek(SeekFrom::Start(0))?;
-            continue;
-        }
-
-        match pipe.write(&payload) {
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => break,
-            Err(error) => {
-                return Err(error);
-            }
         }
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn frame_loop(
-    read_fd: OwnedFd,
     mut gate: File,
     cpu: usize,
-    frame_bytes: usize,
-    chunk_bytes: usize,
     period_ns: u64,
     stop: Arc<AtomicBool>,
     start: Arc<Barrier>,
@@ -260,10 +223,7 @@ fn frame_loop(
     visual_tx: Option<Sender<VisualEvent>>,
 ) -> io::Result<FrameResult> {
     let affinity_result = pin_current_thread(cpu);
-    let mut pipe = File::from(read_fd);
-    let mut buffer = vec![0_u8; chunk_bytes.min(frame_bytes)];
     let mut frame_latencies = Vec::new();
-    let mut pipe_waits = Vec::new();
     let mut gate_waits = Vec::new();
     let mut deadline_misses = 0;
 
@@ -282,26 +242,13 @@ fn frame_loop(
         }
         let gate_start = now_ns()?;
         touch_gate(&mut gate)?;
-        let gate_end = now_ns()?;
-        if let Some(tx) = &visual_tx {
-            let _ = tx.send(VisualEvent::WaitingForPipe);
-        }
-        let pipe_start = now_ns()?;
-        let mut remaining = frame_bytes;
-        while remaining != 0 {
-            let amount = remaining.min(buffer.len());
-            pipe.read_exact(&mut buffer[..amount])?;
-            remaining -= amount;
-        }
         let completed = now_ns()?;
 
         let latency_ns = completed.saturating_sub(release);
         let latency = ns_to_duration(latency_ns);
-        let pipe_wait = ns_to_duration(completed.saturating_sub(pipe_start));
         let missed_deadline = latency_ns > period_ns;
         frame_latencies.push(latency);
-        pipe_waits.push(pipe_wait);
-        gate_waits.push(ns_to_duration(gate_end.saturating_sub(gate_start)));
+        gate_waits.push(ns_to_duration(completed.saturating_sub(gate_start)));
         deadline_misses += usize::from(missed_deadline);
         if let Some(tx) = &sample_tx {
             // The unbounded channel never waits for the reporter. Formatting and
@@ -317,7 +264,6 @@ fn frame_loop(
     stop.store(true, Ordering::Release);
     Ok(FrameResult {
         frame_latencies,
-        pipe_waits,
         gate_waits,
         deadline_misses,
     })
@@ -332,7 +278,11 @@ fn touch_gate(gate: &mut File) -> io::Result<()> {
     Ok(())
 }
 
-fn report_periodically(rx: Receiver<FrameSample>, interval: Duration) {
+fn report_periodically(
+    rx: Receiver<FrameSample>,
+    interval: Duration,
+    visual_tx: Option<Sender<VisualEvent>>,
+) {
     let mut frame_latencies = Vec::new();
     let interval_ns = interval.as_nanos().min(u64::MAX as u128) as u64;
     let started = now_ns().unwrap_or(0);
@@ -341,7 +291,11 @@ fn report_periodically(rx: Receiver<FrameSample>, interval: Duration) {
     loop {
         let now = now_ns().unwrap_or(next_report);
         if now >= next_report {
-            stats::print_compact_summary(&frame_latencies);
+            let summary = stats::Summary::from_samples(&frame_latencies);
+            stats::print_compact_summary(summary);
+            if let Some(tx) = &visual_tx {
+                let _ = tx.send(VisualEvent::IntervalSummary { summary });
+            }
             frame_latencies.clear();
             next_report = next_report.saturating_add(interval_ns);
             while next_report <= now {

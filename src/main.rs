@@ -32,8 +32,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         "  frame period:        {}",
         stats::format_duration(result.frame_period)
     );
-    println!("  bytes per frame:     {}", args.frame_bytes);
-    println!("  pipe operation size: {}", args.chunk_bytes);
     println!("  mutex-owner read:    {} bytes", args.lock_bytes);
 
     stats::print_summary(
@@ -44,7 +42,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         "Kernel mutex gate (shared file-position access)",
         &result.gate_waits,
     );
-    stats::print_summary("Pipe wait (reading one frame payload)", &result.pipe_waits);
     println!(
         "\nMissed frame deadlines: {} / {} ({:.2}%)",
         result.deadline_misses,
@@ -59,23 +56,18 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn save_csv(path: &Path, result: &workload::RunResult) -> Result<(), Box<dyn Error>> {
     let mut output = BufWriter::new(File::create(path)?);
-    writeln!(
-        output,
-        "frame,latency_ns,gate_wait_ns,pipe_wait_ns,missed_deadline"
-    )?;
-    for (index, ((latency, gate), pipe)) in result
+    writeln!(output, "frame,latency_ns,gate_wait_ns,missed_deadline")?;
+    for (index, (latency, gate)) in result
         .frame_latencies
         .iter()
         .zip(&result.gate_waits)
-        .zip(&result.pipe_waits)
         .enumerate()
     {
         writeln!(
             output,
-            "{index},{},{},{},{}",
+            "{index},{},{},{}",
             latency.as_nanos(),
             gate.as_nanos(),
-            pipe.as_nanos(),
             latency > &result.frame_period,
         )?;
     }
