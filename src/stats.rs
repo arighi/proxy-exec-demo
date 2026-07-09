@@ -45,13 +45,13 @@ pub fn print_compact_summary(samples: &[Duration]) {
     };
 
     println!(
-        "mean={:.3} us p50={:.3} us p90={:.3} us p95={:.3} us p99={:.3} us max={:.3} us",
-        summary.average / 1_000.0,
-        summary.median as f64 / 1_000.0,
-        summary.p90 as f64 / 1_000.0,
-        summary.p95 as f64 / 1_000.0,
-        summary.p99 as f64 / 1_000.0,
-        summary.max as f64 / 1_000.0,
+        "mean={:.3} ms p50={:.3} ms p90={:.3} ms p95={:.3} ms p99={:.3} ms max={:.3} ms",
+        summary.average / 1_000_000.0,
+        summary.median as f64 / 1_000_000.0,
+        summary.p90 as f64 / 1_000_000.0,
+        summary.p95 as f64 / 1_000_000.0,
+        summary.p99 as f64 / 1_000_000.0,
+        summary.max as f64 / 1_000_000.0,
     );
 }
 

@@ -50,17 +50,18 @@ the baseline overlaid in gray:
   --compare disabled.csv --output enabled.csv
 ```
 
-The top row shows the frame, kernel mutex, pipe worker, and competing CPU task.
-Real wait events produce a short yellow pulse so even fast proxy-assisted lock
-transitions remain visible. The middle bar splits the latest frame between
-mutex-gate and pipe wait. The bottom graph shows live frame latency in green,
-deadline misses in red, the target deadline as a red line, and an optional
-comparison run behind it in gray. The numeric row matches the periodic terminal
-summary: mean, p50, p90, p95, p99, and maximum latency in microseconds. It
-refreshes every `--stats-interval` seconds, or every second when that option is
-omitted. The window title reports actual presented FPS,
-completed workload FPS, and the latest timings. Phase-only UI redraws are not
-counted as presented workload frames. When the affinity mask
+The anti-aliased dashboard uses modern status cards for the frame, kernel mutex,
+pipe worker, and competing CPU task. Real wait events produce a short highlight
+so even fast proxy-assisted lock transitions remain visible. Separate,
+deadline-scaled bars show average mutex-gate and pipe wait over a stable 500 ms
+window. A minimum-width marker keeps nonzero subpixel waits visible while the
+numeric value remains exact. The interactive chart
+shows current latency as a filled green line, the deadline in red, and an
+optional comparison run in gray; hover it for exact values. Statistic cards
+match the periodic terminal summary: mean, p50, p90, p95, p99, and maximum
+latency in milliseconds. They refresh every `--stats-interval` seconds, or every second when that
+option is omitted. Header badges report presented and completed-workload FPS.
+When the affinity mask
 contains another CPU, the OpenGL/event thread is moved there so dashboard
 rendering does not compete with workload threads on the measured CPU.
 
