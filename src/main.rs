@@ -3,9 +3,13 @@
 mod cli;
 mod stats;
 mod timing;
+mod visual;
 mod workload;
 
 use std::error::Error;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::Path;
 
 use clap::Parser;
 
@@ -15,7 +19,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     args.validate()?;
 
-    let result = workload::run(&args)?;
+    let result = if args.visual {
+        visual::run(&args)?
+    } else {
+        workload::run(&args)?
+    };
+    if let Some(path) = &args.output {
+        save_csv(path, &result)?;
+    }
 
     println!("\nConfiguration");
     println!("  CPU:                 {}", result.cpu);
@@ -48,5 +59,31 @@ fn main() -> Result<(), Box<dyn Error>> {
         stats::print_histogram("Frame latency histogram", &result.frame_latencies, 20);
     }
 
+    Ok(())
+}
+
+fn save_csv(path: &Path, result: &workload::RunResult) -> Result<(), Box<dyn Error>> {
+    let mut output = BufWriter::new(File::create(path)?);
+    writeln!(
+        output,
+        "frame,latency_ns,gate_wait_ns,pipe_wait_ns,missed_deadline"
+    )?;
+    for (index, ((latency, gate), pipe)) in result
+        .frame_latencies
+        .iter()
+        .zip(&result.gate_waits)
+        .zip(&result.pipe_waits)
+        .enumerate()
+    {
+        writeln!(
+            output,
+            "{index},{},{},{},{}",
+            latency.as_nanos(),
+            gate.as_nanos(),
+            pipe.as_nanos(),
+            latency > &result.frame_period,
+        )?;
+    }
+    output.flush()?;
     Ok(())
 }

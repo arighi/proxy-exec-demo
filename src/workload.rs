@@ -37,7 +37,33 @@ struct FrameSample {
     latency: Duration,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum VisualEvent {
+    WaitingForGate,
+    WaitingForPipe,
+    FrameComplete {
+        latency: Duration,
+        gate_wait: Duration,
+        pipe_wait: Duration,
+        missed_deadline: bool,
+    },
+}
+
 pub fn run(args: &Args) -> Result<RunResult, Box<dyn Error>> {
+    run_inner(args, None)
+}
+
+pub fn run_visual(
+    args: &Args,
+    visual_tx: Sender<VisualEvent>,
+) -> Result<RunResult, Box<dyn Error>> {
+    run_inner(args, Some(visual_tx))
+}
+
+fn run_inner(
+    args: &Args,
+    visual_tx: Option<Sender<VisualEvent>>,
+) -> Result<RunResult, Box<dyn Error>> {
     let cpu = select_cpu(args.cpu)?;
     let period_ns = 1_000_000_000_u64 / args.fps as u64;
     let duration_ns = args
@@ -100,6 +126,7 @@ pub fn run(args: &Args) -> Result<RunResult, Box<dyn Error>> {
             frame_stop,
             frame_start,
             sample_tx,
+            visual_tx,
         )
     })?;
 
@@ -123,7 +150,7 @@ pub fn run(args: &Args) -> Result<RunResult, Box<dyn Error>> {
     })
 }
 
-fn select_cpu(requested: Option<usize>) -> Result<usize, Box<dyn Error>> {
+pub(crate) fn select_cpu(requested: Option<usize>) -> Result<usize, Box<dyn Error>> {
     let allowed = sched_getaffinity(Pid::from_raw(0))?;
     if let Some(cpu) = requested {
         if cpu >= CpuSet::count() || !allowed.is_set(cpu)? {
@@ -137,6 +164,18 @@ fn select_cpu(requested: Option<usize>) -> Result<usize, Box<dyn Error>> {
     (0..CpuSet::count())
         .find(|&cpu| allowed.is_set(cpu).unwrap_or(false))
         .ok_or_else(|| "the process has no allowed CPUs".into())
+}
+
+pub(crate) fn pin_current_thread_away_from(
+    workload_cpu: usize,
+) -> Result<Option<usize>, Box<dyn Error>> {
+    let allowed = sched_getaffinity(Pid::from_raw(0))?;
+    let visual_cpu = (0..CpuSet::count())
+        .find(|&cpu| cpu != workload_cpu && allowed.is_set(cpu).unwrap_or(false));
+    if let Some(cpu) = visual_cpu {
+        pin_current_thread(cpu)?;
+    }
+    Ok(visual_cpu)
 }
 
 fn pin_current_thread(cpu: usize) -> io::Result<()> {
@@ -231,6 +270,7 @@ fn frame_loop(
     stop: Arc<AtomicBool>,
     start: Arc<Barrier>,
     sample_tx: Option<Sender<FrameSample>>,
+    visual_tx: Option<Sender<VisualEvent>>,
 ) -> io::Result<FrameResult> {
     let affinity_result = pin_current_thread(cpu);
     let mut pipe = File::from(read_fd);
@@ -249,9 +289,15 @@ fn frame_loop(
 
     while release < end {
         sleep_until(release)?;
+        if let Some(tx) = &visual_tx {
+            let _ = tx.send(VisualEvent::WaitingForGate);
+        }
         let gate_start = now_ns()?;
         touch_gate(&mut gate)?;
         let gate_end = now_ns()?;
+        if let Some(tx) = &visual_tx {
+            let _ = tx.send(VisualEvent::WaitingForPipe);
+        }
         let pipe_start = now_ns()?;
         let mut remaining = frame_bytes;
         while remaining != 0 {
@@ -273,6 +319,14 @@ fn frame_loop(
             // The unbounded channel never waits for the reporter. Formatting and
             // terminal I/O therefore stay out of the measured frame path.
             let _ = tx.send(FrameSample { latency });
+        }
+        if let Some(tx) = &visual_tx {
+            let _ = tx.send(VisualEvent::FrameComplete {
+                latency,
+                gate_wait: ns_to_duration(gate_end.saturating_sub(gate_start)),
+                pipe_wait,
+                missed_deadline,
+            });
         }
         release = release.saturating_add(period_ns);
     }

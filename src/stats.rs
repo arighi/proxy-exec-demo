@@ -1,19 +1,19 @@
 use std::time::Duration;
 
-#[derive(Debug)]
-struct Summary {
-    min: u64,
-    average: f64,
-    median: u64,
-    p90: u64,
-    p95: u64,
-    p99: u64,
-    p999: u64,
-    max: u64,
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Summary {
+    pub(crate) min: u64,
+    pub(crate) average: f64,
+    pub(crate) median: u64,
+    pub(crate) p90: u64,
+    pub(crate) p95: u64,
+    pub(crate) p99: u64,
+    pub(crate) p999: u64,
+    pub(crate) max: u64,
 }
 
 impl Summary {
-    fn from_samples(samples: &[Duration]) -> Option<Self> {
+    pub(crate) fn from_samples(samples: &[Duration]) -> Option<Self> {
         if samples.is_empty() {
             return None;
         }
@@ -40,13 +40,12 @@ impl Summary {
 
 pub fn print_compact_summary(samples: &[Duration]) {
     let Some(summary) = Summary::from_samples(samples) else {
-        println!("samples=0");
+        println!("no data");
         return;
     };
 
     println!(
-        "samples={} mean={:.3} us p50={:.3} us p90={:.3} us p95={:.3} us p99={:.3} us max={:.3} us",
-        samples.len(),
+        "mean={:.3} us p50={:.3} us p90={:.3} us p95={:.3} us p99={:.3} us max={:.3} us",
         summary.average / 1_000.0,
         summary.median as f64 / 1_000.0,
         summary.p90 as f64 / 1_000.0,

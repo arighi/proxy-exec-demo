@@ -1,9 +1,10 @@
 use std::error::Error;
+use std::path::PathBuf;
 
 use clap::Parser;
 
 /// Exercise a proxy-executable kernel mutex dependency and a pipe data path.
-#[derive(Debug, Parser)]
+#[derive(Clone, Debug, Parser)]
 #[command(version, about, long_about = None)]
 pub struct Args {
     /// Length of the measurement run, in seconds.
@@ -39,6 +40,22 @@ pub struct Args {
     /// Print and reset runtime statistics at this interval, in seconds.
     #[arg(long, value_name = "SECONDS")]
     pub stats_interval: Option<u64>,
+
+    /// Open an OpenGL visualization instead of printing only a final report.
+    #[arg(long)]
+    pub visual: bool,
+
+    /// Label shown by the visualization (for example, "proxy disabled").
+    #[arg(long, default_value = "current scheduler")]
+    pub label: String,
+
+    /// Save per-frame measurements as CSV after the run.
+    #[arg(long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
+
+    /// Overlay latencies from a CSV created by --output (visual mode only).
+    #[arg(long, value_name = "PATH", requires = "visual")]
+    pub compare: Option<PathBuf>,
 }
 
 impl Args {

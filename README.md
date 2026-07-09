@@ -33,6 +33,37 @@ scheduler disabled and once with it enabled. Compare p95, p99, p99.9, maximum,
 and missed deadlines rather than relying only on the mean. For cleaner results,
 avoid moving unrelated work onto the selected CPU between runs.
 
+## OpenGL visualization
+
+Build in release mode, then record a baseline with proxy execution disabled:
+
+```console
+cargo build --release
+./target/release/proxy-demo --visual --label "proxy disabled" --output disabled.csv
+```
+
+Enable the target sched_ext scheduler externally and run the same workload with
+the baseline overlaid in gray:
+
+```console
+./target/release/proxy-demo --visual --label "proxy enabled" \
+  --compare disabled.csv --output enabled.csv
+```
+
+The top row shows the frame, kernel mutex, pipe worker, and competing CPU task.
+Real wait events produce a short yellow pulse so even fast proxy-assisted lock
+transitions remain visible. The middle bar splits the latest frame between
+mutex-gate and pipe wait. The bottom graph shows live frame latency in green,
+deadline misses in red, the target deadline as a red line, and an optional
+comparison run behind it in gray. The numeric row matches the periodic terminal
+summary: mean, p50, p90, p95, p99, and maximum latency in microseconds. It
+refreshes every `--stats-interval` seconds, or every second when that option is
+omitted. The window title reports actual presented FPS,
+completed workload FPS, and the latest timings. Phase-only UI redraws are not
+counted as presented workload frames. When the affinity mask
+contains another CPU, the OpenGL/event thread is moved there so dashboard
+rendering does not compete with workload threads on the measured CPU.
+
 ## Why the shared file and pipe pattern
 
 Pipe empty/full waits release the pipe's internal mutex before sleeping. They do
