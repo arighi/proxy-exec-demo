@@ -1,0 +1,10 @@
+[package]
+name = "proxy-demo"
+version = "0.1.0"
+edition = "2021"
+description = "Pipe priority-inversion workload for sched_ext proxy execution demos"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+nix = { version = "0.30", features = ["fs", "sched", "time"] }

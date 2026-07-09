@@ -1,0 +1,52 @@
+#![forbid(unsafe_code)]
+
+mod cli;
+mod stats;
+mod timing;
+mod workload;
+
+use std::error::Error;
+
+use clap::Parser;
+
+use crate::cli::Args;
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let args = Args::parse();
+    args.validate()?;
+
+    let result = workload::run(&args)?;
+
+    println!("\nConfiguration");
+    println!("  CPU:                 {}", result.cpu);
+    println!("  frames:              {}", result.frame_latencies.len());
+    println!(
+        "  frame period:        {}",
+        stats::format_duration(result.frame_period)
+    );
+    println!("  bytes per frame:     {}", args.frame_bytes);
+    println!("  pipe operation size: {}", args.chunk_bytes);
+    println!("  mutex-owner read:    {} bytes", args.lock_bytes);
+
+    stats::print_summary(
+        "Frame latency (scheduled release to completion)",
+        &result.frame_latencies,
+    );
+    stats::print_summary(
+        "Kernel mutex gate (shared file-position access)",
+        &result.gate_waits,
+    );
+    stats::print_summary("Pipe wait (reading one frame payload)", &result.pipe_waits);
+    println!(
+        "\nMissed frame deadlines: {} / {} ({:.2}%)",
+        result.deadline_misses,
+        result.frame_latencies.len(),
+        result.deadline_misses as f64 * 100.0 / result.frame_latencies.len().max(1) as f64
+    );
+
+    if args.histogram {
+        stats::print_histogram("Frame latency histogram", &result.frame_latencies, 20);
+    }
+
+    Ok(())
+}
