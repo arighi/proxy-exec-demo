@@ -15,18 +15,20 @@ large machine.
 ```console
 cargo build --release
 ./target/release/proxy-demo
-./target/release/proxy-demo --duration 10 --histogram
 ./target/release/proxy-demo --stats-interval 5
 ```
 
-Use `--help` for all controls. The default run is 30 seconds at 60 frames per
-second. `--cpu` accepts a logical CPU in the invoking process's current affinity
-mask. Without it, the first allowed CPU is selected, which also works inside a
-cpuset or container. `--stats-interval SECONDS` prints frame-latency statistics
-for each completed interval as a compact line, then resets the periodic sample
-window. Reporting happens on a separate thread so terminal formatting and
-output are not included in measured frame latency. The detailed final report
-always covers the complete run.
+Use `--help` for all controls. The visual dashboard runs at 60 frames per second
+until Escape is pressed or its window is closed. `--cpu` accepts a logical CPU
+in the invoking process's current affinity mask. Without it, the first allowed
+CPU is selected, which also works inside a cpuset or container.
+`--cpu-util PERCENT` controls the CPU worker's duty cycle from 0 to 100; it
+defaults to 100, preserving the always-runnable competing workload.
+`--stats-interval SECONDS` prints frame-latency statistics for each completed
+interval as a compact line, then resets the periodic sample window. Reporting
+happens on a separate thread so terminal formatting and output are not included
+in measured frame latency. After the window closes, the detailed final report
+covers the complete run.
 
 Run the same release binary and arguments once with the target sched_ext
 scheduler disabled and once with it enabled. Compare p95, p99, p99.9, maximum,
@@ -39,34 +41,30 @@ Build in release mode, then record a baseline with proxy execution disabled:
 
 ```console
 cargo build --release
-./target/release/proxy-demo --visual --label "proxy disabled" --output disabled.csv
+./target/release/proxy-demo --label "proxy disabled" --output disabled.csv
 ```
 
 Enable the target sched_ext scheduler externally and run the same workload with
 the baseline overlaid in gray:
 
 ```console
-./target/release/proxy-demo --visual --label "proxy enabled" \
+./target/release/proxy-demo --label "proxy enabled" \
   --compare disabled.csv --output enabled.csv
 ```
 
-The anti-aliased dashboard uses modern status cards for the frame, kernel mutex,
-pipe worker, and competing CPU task. These boxes, their labels, and dependency
-connectors remain static. Only payload packets animate from the pipe worker back
-to the frame, and packet motion stops when frame completion stalls. A full-width
-red CPU-pressure banner spans all three workload nodes to show the
-always-runnable competitor sharing their CPU. Separate,
-deadline-scaled bars show average mutex-gate and pipe wait over a stable 500 ms
-window. A minimum-width marker keeps nonzero subpixel waits visible while the
-numeric value remains exact. The interactive chart
-shows current latency as a filled green line, the deadline in red, and an
-optional comparison run in gray; hover it for exact values. Statistic cards
-match the periodic terminal summary: mean, p50, p90, p95, p99, and maximum
-latency in milliseconds. They refresh every `--stats-interval` seconds, or every second when that
-option is omitted. Header badges report presented and completed-workload FPS.
-When the affinity mask
-contains another CPU, the OpenGL/event thread is moved there so dashboard
-rendering does not compete with workload threads on the measured CPU.
+The anti-aliased dashboard separates control dependencies from data flow. The
+foreground and background threads converge on the shared mutex, while animated
+particles show their bidirectional relationship. Distinct animations identify
+the periodic high-priority foreground workload, low-priority background
+workload, and always-runnable CPU-pressure competitor. The interactive chart
+shows current latency on a fixed zero-to-deadline scale, with the deadline in
+red and an optional comparison run in gray; hover it for exact values.
+Statistic cards show mean, p50, p90, p95, p99, and maximum latency in
+milliseconds. They refresh every `--stats-interval` seconds, or every second
+when that option is omitted. Header badges report presented and
+completed-workload FPS. When the affinity mask contains another CPU, the
+OpenGL/event thread is moved there so dashboard rendering does not compete with
+workload threads on the measured CPU.
 
 ## Why the shared file and pipe pattern
 

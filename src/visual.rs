@@ -1,7 +1,9 @@
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fs;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -28,13 +30,7 @@ struct Dashboard {
     data_flow_until: Instant,
     latencies: VecDeque<Duration>,
     comparison: Vec<Duration>,
-    gate_wait: Duration,
-    pipe_wait: Duration,
-    gate_wait_total_ns: u128,
-    pipe_wait_total_ns: u128,
-    dependency_sample_count: u64,
-    next_dependency_update: Instant,
-    missed: bool,
+    mutex_locked: bool,
     frames_this_second: u64,
     workload_fps: f64,
     fps_epoch: Instant,
@@ -52,13 +48,7 @@ impl Dashboard {
             data_flow_until: now,
             latencies: VecDeque::with_capacity(180),
             comparison,
-            gate_wait: Duration::ZERO,
-            pipe_wait: Duration::ZERO,
-            gate_wait_total_ns: 0,
-            pipe_wait_total_ns: 0,
-            dependency_sample_count: 0,
-            next_dependency_update: now + Duration::from_millis(500),
-            missed: false,
+            mutex_locked: false,
             frames_this_second: 0,
             workload_fps: 0.0,
             fps_epoch: now,
@@ -72,18 +62,11 @@ impl Dashboard {
 
     fn apply(&mut self, event: VisualEvent) {
         match event {
-            VisualEvent::WaitingForGate | VisualEvent::WaitingForPipe => {}
-            VisualEvent::FrameComplete {
-                latency,
-                gate_wait,
-                pipe_wait,
-                missed_deadline,
-            } => {
+            VisualEvent::WaitingForGate => self.mutex_locked = true,
+            VisualEvent::WaitingForPipe => self.mutex_locked = false,
+            VisualEvent::FrameComplete { latency } => {
+                self.mutex_locked = false;
                 self.data_flow_until = Instant::now() + Duration::from_millis(120);
-                self.missed = missed_deadline;
-                self.gate_wait_total_ns += gate_wait.as_nanos();
-                self.pipe_wait_total_ns += pipe_wait.as_nanos();
-                self.dependency_sample_count += 1;
                 if self.latencies.len() == 180 {
                     self.latencies.pop_front();
                 }
@@ -93,15 +76,6 @@ impl Dashboard {
                 self.total_frames += 1;
 
                 let now = Instant::now();
-                if now >= self.next_dependency_update {
-                    let count = self.dependency_sample_count.max(1) as u128;
-                    self.gate_wait = duration_from_nanos(self.gate_wait_total_ns / count);
-                    self.pipe_wait = duration_from_nanos(self.pipe_wait_total_ns / count);
-                    self.gate_wait_total_ns = 0;
-                    self.pipe_wait_total_ns = 0;
-                    self.dependency_sample_count = 0;
-                    self.next_dependency_update = now + Duration::from_millis(500);
-                }
                 if now >= self.next_metrics_update {
                     self.displayed_summary = Summary::from_samples(&self.interval_samples);
                     self.interval_samples.clear();
@@ -129,8 +103,8 @@ impl Dashboard {
 struct VisualApp {
     events: mpsc::Receiver<VisualEvent>,
     dashboard: Dashboard,
-    label: String,
     period: Duration,
+    stop: Arc<AtomicBool>,
     disconnected: bool,
     last_presented_frame: u64,
     presented_this_second: u64,
@@ -143,15 +117,15 @@ impl VisualApp {
         context: &egui::Context,
         events: mpsc::Receiver<VisualEvent>,
         dashboard: Dashboard,
-        label: String,
         period: Duration,
+        stop: Arc<AtomicBool>,
     ) -> Self {
         configure_style(context);
         Self {
             events,
             dashboard,
-            label,
             period,
+            stop,
             disconnected: false,
             last_presented_frame: 0,
             presented_this_second: 0,
@@ -201,7 +175,6 @@ impl VisualApp {
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                badge(ui, &self.label.to_uppercase(), VIOLET);
                 metric_pill(
                     ui,
                     "WORKLOAD",
@@ -215,60 +188,19 @@ impl VisualApp {
     fn draw_dependency_chain(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new("Execution path")
+                RichText::new("Control and data flow")
                     .size(18.0)
                     .color(TEXT)
                     .strong(),
             );
             ui.label(
-                RichText::new("FRAME  →  MUTEX GATE  →  PIPE WORKER")
+                RichText::new("FILE LOCK CONTROLS ORDER  ·  PIPE CARRIES DATA")
                     .size(13.0)
                     .color(MUTED),
             );
         });
         ui.add_space(8.0);
         flow_diagram(ui, &self.dashboard);
-    }
-
-    fn draw_wait_split(&self, ui: &mut egui::Ui) {
-        modern_panel(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("Average dependency wait")
-                        .size(16.0)
-                        .color(TEXT)
-                        .strong(),
-                );
-                ui.label(RichText::new("500 ms window").size(12.0).color(MUTED));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    badge(
-                        ui,
-                        if self.dashboard.missed {
-                            "MISSED DEADLINE"
-                        } else {
-                            "WITHIN DEADLINE"
-                        },
-                        if self.dashboard.missed { RED } else { GREEN },
-                    );
-                });
-            });
-            ui.add_space(12.0);
-            wait_bar(
-                ui,
-                "Mutex gate",
-                self.dashboard.gate_wait,
-                self.period,
-                AMBER,
-            );
-            ui.add_space(12.0);
-            wait_bar(
-                ui,
-                "Pipe wait",
-                self.dashboard.pipe_wait,
-                self.period,
-                VIOLET,
-            );
-        });
     }
 
     fn draw_statistics(&self, ui: &mut egui::Ui) {
@@ -311,6 +243,8 @@ impl VisualApp {
 
     fn draw_plot(&self, ui: &mut egui::Ui) {
         modern_panel(ui, |ui| {
+            let deadline_ms = self.period.as_secs_f64() * 1000.0;
+
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("Frame latency")
@@ -356,6 +290,7 @@ impl VisualApp {
                 .y_axis_label("Latency (ms)")
                 .legend(Legend::default())
                 .show(ui, |plot_ui| {
+                    plot_ui.set_plot_bounds_y(0.0..=deadline_ms);
                     if !self.dashboard.comparison.is_empty() {
                         plot_ui.line(
                             Line::new("Baseline", comparison)
@@ -370,20 +305,39 @@ impl VisualApp {
                             .fill(0.0)
                             .fill_alpha(0.08),
                     );
-                    plot_ui.hline(
-                        HLine::new("Deadline", self.period.as_secs_f64() * 1000.0)
-                            .color(RED)
-                            .width(1.5),
-                    );
+                    plot_ui.hline(HLine::new("Deadline", deadline_ms).color(RED).width(1.5));
                 });
         });
     }
 }
 
 impl eframe::App for VisualApp {
+    fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        let (escape_pressed, close_requested) = context.input(|input| {
+            let escape_pressed = input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::Escape,
+                        pressed: true,
+                        ..
+                    }
+                )
+            });
+            (escape_pressed, input.viewport().close_requested())
+        });
+        if escape_pressed || close_requested {
+            self.stop.store(true, Ordering::Release);
+        }
+        if escape_pressed {
+            context.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.receive_events();
         if self.disconnected {
+            self.stop.store(true, Ordering::Release);
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
@@ -394,8 +348,6 @@ impl eframe::App for VisualApp {
                 self.draw_header(ui);
                 ui.add_space(22.0);
                 self.draw_dependency_chain(ui);
-                ui.add_space(16.0);
-                self.draw_wait_split(ui);
                 ui.add_space(18.0);
                 self.draw_statistics(ui);
                 ui.add_space(16.0);
@@ -410,6 +362,12 @@ impl eframe::App for VisualApp {
     }
 }
 
+impl Drop for VisualApp {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
 pub fn run(args: &Args) -> Result<RunResult, Box<dyn Error>> {
     let comparison = args
         .compare
@@ -419,9 +377,12 @@ pub fn run(args: &Args) -> Result<RunResult, Box<dyn Error>> {
         .unwrap_or_default();
     let (visual_tx, visual_rx) = mpsc::channel();
     let workload_cpu = workload::select_cpu(args.cpu)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = Arc::clone(&stop);
     let worker_args = args.clone();
     let worker = thread::spawn(move || {
-        workload::run_visual(&worker_args, visual_tx).map_err(|error| error.to_string())
+        workload::run_visual(&worker_args, visual_tx, worker_stop)
+            .map_err(|error| error.to_string())
     });
     let _visual_cpu = workload::pin_current_thread_away_from(workload_cpu)?;
 
@@ -429,9 +390,9 @@ pub fn run(args: &Args) -> Result<RunResult, Box<dyn Error>> {
         comparison,
         Duration::from_secs(args.stats_interval.unwrap_or(1)),
     );
-    let label = args.label.clone();
     let period = Duration::from_nanos(1_000_000_000_u64 / args.fps as u64);
     let title = format!("proxy-demo · {}", args.label);
+    let app_stop = Arc::clone(&stop);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 900.0])
@@ -440,7 +401,7 @@ pub fn run(args: &Args) -> Result<RunResult, Box<dyn Error>> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let visual_result = eframe::run_native(
         &title,
         options,
         Box::new(move |creation| {
@@ -448,16 +409,19 @@ pub fn run(args: &Args) -> Result<RunResult, Box<dyn Error>> {
                 &creation.egui_ctx,
                 visual_rx,
                 dashboard,
-                label,
                 period,
+                app_stop,
             )))
         }),
-    )?;
+    );
 
-    worker
+    stop.store(true, Ordering::Release);
+    let workload_result = worker
         .join()
         .map_err(|_| "visual workload thread panicked")?
-        .map_err(Into::into)
+        .map_err(Into::into);
+    visual_result?;
+    workload_result
 }
 
 fn configure_style(context: &egui::Context) {
@@ -493,9 +457,9 @@ fn flow_diagram(ui: &mut egui::Ui, dashboard: &Dashboard) {
     painter.rect_filled(canvas, 16.0, PANEL);
 
     let padding = 20.0;
-    let gap = 54.0;
+    let gap = 90.0;
     let node_width = (canvas.width() - padding * 2.0 - gap * 2.0) / 3.0;
-    let node_top = canvas.top() + 52.0;
+    let node_top = canvas.top() + 76.0;
     let node_height = 58.0;
     let nodes: Vec<egui::Rect> = (0..3)
         .map(|index| {
@@ -511,25 +475,48 @@ fn flow_diagram(ui: &mut egui::Ui, dashboard: &Dashboard) {
 
     let time = ui.input(|input| input.time) as f32;
 
-    let cpu_rect = egui::Rect::from_min_max(
-        egui::pos2(nodes[0].left(), canvas.top() + 5.0),
-        egui::pos2(nodes[2].right(), canvas.top() + 37.0),
+    let cpu_rect = egui::Rect::from_min_size(
+        egui::pos2(nodes[1].left(), canvas.top() + 2.0),
+        nodes[1].size(),
     );
     painter.rect_filled(cpu_rect, 10.0, RED);
     painter.rect_filled(cpu_rect.shrink(1.5), 8.5, Color32::from_rgb(47, 25, 38));
+    painter.circle_filled(
+        egui::pos2(cpu_rect.left() + 20.0, cpu_rect.center().y),
+        5.0,
+        RED,
+    );
     painter.text(
-        cpu_rect.center(),
+        egui::pos2(cpu_rect.center().x, cpu_rect.center().y - 8.0),
         egui::Align2::CENTER_CENTER,
-        "CPU pressure thread",
-        egui::FontId::proportional(13.0),
+        "CPU worker thread",
+        egui::FontId::proportional(17.0),
         TEXT,
     );
-    for pair in nodes.windows(2) {
-        let start = egui::pos2(pair[0].right() + 7.0, pair[0].center().y);
-        let end = egui::pos2(pair[1].left() - 10.0, pair[1].center().y);
-        painter.line_segment([start, end], Stroke::new(2.0, BORDER));
-        arrow_right(&painter, end, BORDER);
-    }
+    painter.text(
+        egui::pos2(cpu_rect.center().x, cpu_rect.center().y + 10.0),
+        egui::Align2::CENTER_CENTER,
+        "NORMAL PRIORITY",
+        egui::FontId::proportional(9.0),
+        RED.gamma_multiply(0.85),
+    );
+    draw_cpu_spinner(
+        &painter,
+        egui::pos2(cpu_rect.right() - 22.0, cpu_rect.center().y),
+        time,
+    );
+    let frame_read_start = egui::pos2(nodes[0].right() + 7.0, nodes[0].center().y);
+    let frame_read_end = egui::pos2(nodes[1].left() - 10.0, nodes[1].center().y);
+    painter.line_segment([frame_read_start, frame_read_end], Stroke::new(2.0, BORDER));
+    arrow_right(&painter, frame_read_end, BORDER);
+
+    let worker_read_start = egui::pos2(nodes[2].left() - 7.0, nodes[2].center().y);
+    let worker_read_end = egui::pos2(nodes[1].right() + 10.0, nodes[1].center().y);
+    painter.line_segment(
+        [worker_read_start, worker_read_end],
+        Stroke::new(2.0, BORDER),
+    );
+    arrow_left(&painter, worker_read_end, BORDER);
 
     let pipe_y = canvas.bottom() - 20.0;
     let pipe_points = [
@@ -547,41 +534,138 @@ fn flow_diagram(ui: &mut egui::Ui, dashboard: &Dashboard) {
     for segment in pipe_points.windows(2) {
         painter.line_segment([segment[0], segment[1]], Stroke::new(3.0, pipe_color));
     }
+    arrow_up(&painter, pipe_points[0], pipe_color);
     arrow_up(&painter, pipe_points[3], pipe_color);
-    painter.text(
-        egui::pos2(canvas.center().x, pipe_y - 8.0),
-        egui::Align2::CENTER_BOTTOM,
-        "PIPE PAYLOAD  ·  WORKER → FRAME",
-        egui::FontId::proportional(11.0),
-        if data_active { VIOLET } else { MUTED },
-    );
     if data_active {
         for index in 0..6 {
-            let progress = (time * 0.9 + index as f32 / 6.0).fract();
+            let progress = (time * 0.9 + index as f32 / 3.0).fract();
+            let progress = if index % 2 == 0 {
+                progress
+            } else {
+                1.0 - progress
+            };
             let position = point_on_path(&pipe_points, progress);
             painter.circle_filled(position, 4.0, VIOLET);
             painter.circle_filled(position, 1.7, TEXT);
         }
     }
 
-    draw_flow_node(&painter, nodes[0], "Frame thread", CYAN);
-    draw_flow_node(&painter, nodes[1], "Kernel mutex", AMBER);
-    draw_flow_node(&painter, nodes[2], "Pipe worker", VIOLET);
+    draw_flow_node(
+        &painter,
+        nodes[0],
+        "Foreground thread",
+        Some("HIGH PRIORITY · PERIODIC"),
+        CYAN,
+    );
+    draw_periodic_pulse(&painter, nodes[0], time);
+    draw_mutex_node(&painter, nodes[1], dashboard.mutex_locked);
+    draw_flow_node(
+        &painter,
+        nodes[2],
+        "Background thread",
+        Some("LOW PRIORITY"),
+        VIOLET,
+    );
+    draw_background_io(&painter, nodes[2], time);
 }
 
-fn draw_flow_node(painter: &egui::Painter, rect: egui::Rect, title: &str, accent: Color32) {
+fn draw_cpu_spinner(painter: &egui::Painter, center: egui::Pos2, time: f32) {
+    const SPOKES: usize = 10;
+
+    painter.circle_filled(center, 13.0, Color32::from_rgb(30, 20, 35));
+    for index in 0..SPOKES {
+        let angle = time * std::f32::consts::TAU * 1.5
+            + index as f32 * std::f32::consts::TAU / SPOKES as f32;
+        let direction = egui::vec2(angle.cos(), angle.sin());
+        let brightness = 0.25 + 0.75 * (index + 1) as f32 / SPOKES as f32;
+        painter.line_segment(
+            [center + direction * 6.0, center + direction * 10.0],
+            Stroke::new(2.0, CYAN.gamma_multiply(brightness)),
+        );
+    }
+}
+
+fn draw_flow_node(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    title: &str,
+    subtitle: Option<&str>,
+    accent: Color32,
+) {
     let border = accent.gamma_multiply(0.65);
     let fill = Color32::from_rgb(22, 30, 49);
     painter.rect_filled(rect, 14.0, border);
     painter.rect_filled(rect.shrink(1.5), 12.5, fill);
     painter.circle_filled(egui::pos2(rect.left() + 20.0, rect.center().y), 5.0, accent);
+    let title_y = if subtitle.is_some() {
+        rect.center().y - 8.0
+    } else {
+        rect.center().y
+    };
     painter.text(
-        egui::pos2(rect.left() + 34.0, rect.center().y),
+        egui::pos2(rect.left() + 34.0, title_y),
         egui::Align2::LEFT_CENTER,
         title,
         egui::FontId::proportional(17.0),
         TEXT,
     );
+    if let Some(subtitle) = subtitle {
+        painter.text(
+            egui::pos2(rect.left() + 34.0, rect.center().y + 10.0),
+            egui::Align2::LEFT_CENTER,
+            subtitle,
+            egui::FontId::proportional(9.0),
+            accent.gamma_multiply(0.85),
+        );
+    }
+}
+
+fn draw_mutex_node(painter: &egui::Painter, rect: egui::Rect, locked: bool) {
+    painter.rect_filled(rect, 14.0, AMBER.gamma_multiply(0.65));
+    painter.rect_filled(rect.shrink(1.5), 12.5, Color32::from_rgb(22, 30, 49));
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "Mutex",
+        egui::FontId::proportional(17.0),
+        TEXT,
+    );
+    painter.text(
+        egui::pos2(rect.right() - 10.0, rect.bottom() - 7.0),
+        egui::Align2::RIGHT_BOTTOM,
+        if locked { "LOCKED" } else { "UNLOCKED" },
+        egui::FontId::proportional(9.0),
+        AMBER,
+    );
+}
+
+fn draw_periodic_pulse(painter: &egui::Painter, rect: egui::Rect, time: f32) {
+    let center = egui::pos2(rect.left() + 20.0, rect.center().y);
+    for offset in [0.0, 0.5] {
+        let phase = (time * 1.5 + offset).fract();
+        painter.circle_stroke(
+            center,
+            6.0 + phase * 12.0,
+            Stroke::new(1.5, CYAN.gamma_multiply(1.0 - phase)),
+        );
+    }
+    let heartbeat = 0.75 + 0.25 * (time * std::f32::consts::TAU * 1.5).sin().abs();
+    painter.circle_filled(
+        center,
+        4.0 + heartbeat * 2.0,
+        CYAN.gamma_multiply(heartbeat),
+    );
+}
+
+fn draw_background_io(painter: &egui::Painter, rect: egui::Rect, time: f32) {
+    let start = egui::pos2(rect.left() + 16.0, rect.bottom() - 6.0);
+    let end = egui::pos2(rect.right() - 16.0, start.y);
+    painter.line_segment([start, end], Stroke::new(1.0, VIOLET.gamma_multiply(0.25)));
+    for index in 0..4 {
+        let progress = (time * 0.25 + index as f32 / 4.0).fract();
+        let position = lerp(start, end, progress);
+        painter.circle_filled(position, 2.5, VIOLET.gamma_multiply(0.45 + progress * 0.55));
+    }
 }
 
 fn arrow_right(painter: &egui::Painter, tip: egui::Pos2, color: Color32) {
@@ -591,6 +675,14 @@ fn arrow_right(painter: &egui::Painter, tip: egui::Pos2, color: Color32) {
             tip + egui::vec2(-8.0, -5.0),
             tip + egui::vec2(-8.0, 5.0),
         ],
+        color,
+        Stroke::NONE,
+    ));
+}
+
+fn arrow_left(painter: &egui::Painter, tip: egui::Pos2, color: Color32) {
+    painter.add(egui::Shape::convex_polygon(
+        vec![tip, tip + egui::vec2(8.0, -5.0), tip + egui::vec2(8.0, 5.0)],
         color,
         Stroke::NONE,
     ));
@@ -646,17 +738,6 @@ fn stat_card(ui: &mut egui::Ui, label: &str, value_ns: Option<f64>) {
         });
 }
 
-fn badge(ui: &mut egui::Ui, text: &str, color: Color32) {
-    egui::Frame::new()
-        .fill(color.gamma_multiply(0.18))
-        .stroke(Stroke::new(1.0, color.gamma_multiply(0.65)))
-        .corner_radius(20.0)
-        .inner_margin(egui::Margin::symmetric(12, 6))
-        .show(ui, |ui| {
-            ui.label(RichText::new(text).size(11.0).color(color).strong());
-        });
-}
-
 fn metric_pill(ui: &mut egui::Ui, label: &str, value: String) {
     egui::Frame::new()
         .fill(PANEL)
@@ -671,55 +752,12 @@ fn metric_pill(ui: &mut egui::Ui, label: &str, value: String) {
         });
 }
 
-fn wait_bar(ui: &mut egui::Ui, label: &str, value: Duration, range: Duration, color: Color32) {
-    let fraction = if range.is_zero() {
-        0.0
-    } else {
-        (value.as_secs_f32() / range.as_secs_f32()).clamp(0.0, 1.0)
-    };
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("●").color(color));
-        ui.label(RichText::new(label).size(13.0).color(TEXT).strong());
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(
-                RichText::new(format!("deadline scale {}", format_duration(range)))
-                    .size(11.0)
-                    .color(MUTED),
-            );
-            ui.label(
-                RichText::new(format_duration(value))
-                    .size(13.0)
-                    .color(TEXT)
-                    .strong(),
-            );
-        });
-    });
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::hover());
-    ui.painter()
-        .rect_filled(rect, 5.0, Color32::from_rgb(31, 40, 61));
-    let filled = egui::Rect::from_min_max(
-        rect.min,
-        egui::pos2(rect.left() + rect.width() * fraction, rect.bottom()),
-    );
-    ui.painter().rect_filled(filled, 5.0, color);
-    if !value.is_zero() && filled.width() < 2.0 {
-        let marker =
-            egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + 2.0, rect.bottom()));
-        ui.painter().rect_filled(marker, 5.0, color);
-    }
-}
-
 fn format_duration(value: Duration) -> String {
     if value >= Duration::from_millis(1) {
         format!("{:.2} ms", value.as_secs_f64() * 1_000.0)
     } else {
         format!("{:.1} µs", value.as_secs_f64() * 1_000_000.0)
     }
-}
-
-fn duration_from_nanos(nanoseconds: u128) -> Duration {
-    Duration::from_nanos(nanoseconds.min(u64::MAX as u128) as u64)
 }
 
 fn load_comparison(path: &std::path::Path) -> Result<Vec<Duration>, Box<dyn Error>> {

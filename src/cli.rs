@@ -7,10 +7,6 @@ use clap::Parser;
 #[derive(Clone, Debug, Parser)]
 #[command(version, about, long_about = None)]
 pub struct Args {
-    /// Length of the measurement run, in seconds.
-    #[arg(long, default_value_t = 30)]
-    pub duration: u64,
-
     /// Target frame rate.
     #[arg(long, default_value_t = 60)]
     pub fps: u32,
@@ -19,6 +15,10 @@ pub struct Args {
     /// allowed by the process's affinity mask.
     #[arg(long)]
     pub cpu: Option<usize>,
+
+    /// Target utilization of the CPU worker thread, as a percentage.
+    #[arg(long, value_name = "PERCENT", default_value_t = 100)]
+    pub cpu_util: u8,
 
     /// Number of bytes that must be read from the pipe to finish each frame.
     #[arg(long, default_value_t = 64)]
@@ -33,17 +33,9 @@ pub struct Args {
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
     pub lock_bytes: usize,
 
-    /// Print an ASCII histogram of frame latencies.
-    #[arg(long)]
-    pub histogram: bool,
-
     /// Print and reset runtime statistics at this interval, in seconds.
     #[arg(long, value_name = "SECONDS")]
     pub stats_interval: Option<u64>,
-
-    /// Open an OpenGL visualization instead of printing only a final report.
-    #[arg(long)]
-    pub visual: bool,
 
     /// Label shown by the visualization (for example, "proxy disabled").
     #[arg(long, default_value = "current scheduler")]
@@ -53,18 +45,18 @@ pub struct Args {
     #[arg(long, value_name = "PATH")]
     pub output: Option<PathBuf>,
 
-    /// Overlay latencies from a CSV created by --output (visual mode only).
-    #[arg(long, value_name = "PATH", requires = "visual")]
+    /// Overlay latencies from a CSV created by --output.
+    #[arg(long, value_name = "PATH")]
     pub compare: Option<PathBuf>,
 }
 
 impl Args {
     pub fn validate(&self) -> Result<(), Box<dyn Error>> {
-        if self.duration == 0 {
-            return Err("--duration must be greater than zero".into());
-        }
         if self.fps == 0 || self.fps > 1_000_000_000 {
             return Err("--fps must be between 1 and 1000000000".into());
+        }
+        if self.cpu_util > 100 {
+            return Err("--cpu-util must be between 0 and 100".into());
         }
         if self.frame_bytes == 0 {
             return Err("--frame-bytes must be greater than zero".into());
@@ -79,5 +71,35 @@ impl Args {
             return Err("--stats-interval must be greater than zero".into());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_util_defaults_to_one_hundred_percent() {
+        let args = Args::try_parse_from(["proxy-demo"]).unwrap();
+
+        assert_eq!(args.cpu_util, 100);
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn cpu_util_accepts_zero_percent() {
+        let args = Args::try_parse_from(["proxy-demo", "--cpu-util", "0"]).unwrap();
+
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn cpu_util_rejects_values_above_one_hundred_percent() {
+        let args = Args::try_parse_from(["proxy-demo", "--cpu-util", "101"]).unwrap();
+
+        assert_eq!(
+            args.validate().unwrap_err().to_string(),
+            "--cpu-util must be between 0 and 100"
+        );
     }
 }

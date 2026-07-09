@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::sched::{sched_getaffinity, sched_setaffinity, CpuSet};
@@ -41,40 +41,28 @@ struct FrameSample {
 pub enum VisualEvent {
     WaitingForGate,
     WaitingForPipe,
-    FrameComplete {
-        latency: Duration,
-        gate_wait: Duration,
-        pipe_wait: Duration,
-        missed_deadline: bool,
-    },
-}
-
-pub fn run(args: &Args) -> Result<RunResult, Box<dyn Error>> {
-    run_inner(args, None)
+    FrameComplete { latency: Duration },
 }
 
 pub fn run_visual(
     args: &Args,
     visual_tx: Sender<VisualEvent>,
+    stop: Arc<AtomicBool>,
 ) -> Result<RunResult, Box<dyn Error>> {
-    run_inner(args, Some(visual_tx))
+    run_inner(args, Some(visual_tx), stop)
 }
 
 fn run_inner(
     args: &Args,
     visual_tx: Option<Sender<VisualEvent>>,
+    stop: Arc<AtomicBool>,
 ) -> Result<RunResult, Box<dyn Error>> {
     let cpu = select_cpu(args.cpu)?;
     let period_ns = 1_000_000_000_u64 / args.fps as u64;
-    let duration_ns = args
-        .duration
-        .checked_mul(1_000_000_000)
-        .ok_or("--duration is too large")?;
 
     let (read_fd, write_fd) = pipe()?;
     set_nonblocking(&write_fd)?;
     let (frame_gate, worker_gate) = create_gate_file(args.lock_bytes)?;
-    let stop = Arc::new(AtomicBool::new(false));
     let start = Arc::new(Barrier::new(3));
     let (sample_tx, reporter) = if let Some(interval) = args.stats_interval {
         let (tx, rx) = mpsc::channel();
@@ -106,9 +94,10 @@ fn run_inner(
 
     let cpu_stop = Arc::clone(&stop);
     let cpu_start = Arc::clone(&start);
+    let cpu_util = args.cpu_util;
     let cpu_worker = thread::Builder::new()
         .name("cpu-worker".into())
-        .spawn(move || burn_cpu(cpu, cpu_stop, cpu_start))?;
+        .spawn(move || burn_cpu(cpu, cpu_util, cpu_stop, cpu_start))?;
 
     let frame_stop = Arc::clone(&stop);
     let frame_start = Arc::clone(&start);
@@ -122,7 +111,6 @@ fn run_inner(
             frame_bytes,
             frame_chunk_bytes,
             period_ns,
-            duration_ns,
             frame_stop,
             frame_start,
             sample_tx,
@@ -266,7 +254,6 @@ fn frame_loop(
     frame_bytes: usize,
     chunk_bytes: usize,
     period_ns: u64,
-    duration_ns: u64,
     stop: Arc<AtomicBool>,
     start: Arc<Barrier>,
     sample_tx: Option<Sender<FrameSample>>,
@@ -275,20 +262,21 @@ fn frame_loop(
     let affinity_result = pin_current_thread(cpu);
     let mut pipe = File::from(read_fd);
     let mut buffer = vec![0_u8; chunk_bytes.min(frame_bytes)];
-    let expected_frames = (duration_ns / period_ns) as usize;
-    let mut frame_latencies = Vec::with_capacity(expected_frames);
-    let mut pipe_waits = Vec::with_capacity(expected_frames);
-    let mut gate_waits = Vec::with_capacity(expected_frames);
+    let mut frame_latencies = Vec::new();
+    let mut pipe_waits = Vec::new();
+    let mut gate_waits = Vec::new();
     let mut deadline_misses = 0;
 
     start.wait();
     affinity_result?;
     let epoch = now_ns()?;
-    let end = epoch.saturating_add(duration_ns);
     let mut release = epoch.saturating_add(period_ns);
 
-    while release < end {
+    while !stop.load(Ordering::Acquire) {
         sleep_until(release)?;
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
         if let Some(tx) = &visual_tx {
             let _ = tx.send(VisualEvent::WaitingForGate);
         }
@@ -321,12 +309,7 @@ fn frame_loop(
             let _ = tx.send(FrameSample { latency });
         }
         if let Some(tx) = &visual_tx {
-            let _ = tx.send(VisualEvent::FrameComplete {
-                latency,
-                gate_wait: ns_to_duration(gate_end.saturating_sub(gate_start)),
-                pipe_wait,
-                missed_deadline,
-            });
+            let _ = tx.send(VisualEvent::FrameComplete { latency });
         }
         release = release.saturating_add(period_ns);
     }
@@ -377,7 +360,7 @@ fn report_periodically(rx: Receiver<FrameSample>, interval: Duration) {
     }
 }
 
-fn burn_cpu(cpu: usize, stop: Arc<AtomicBool>, start: Arc<Barrier>) {
+fn burn_cpu(cpu: usize, utilization: u8, stop: Arc<AtomicBool>, start: Arc<Barrier>) {
     let affinity_result = pin_current_thread(cpu);
     start.wait();
     if let Err(error) = affinity_result {
@@ -386,16 +369,30 @@ fn burn_cpu(cpu: usize, stop: Arc<AtomicBool>, start: Arc<Barrier>) {
         return;
     }
 
-    // A data-dependent integer loop resists optimization and never intentionally
-    // yields or sleeps. The relaxed poll is sufficient for eventual shutdown.
+    // Lower utilization values use a short duty cycle. Keeping the cycle fixed
+    // bounds sleep/wake granularity while making 100% retain the original
+    // always-runnable behavior.
+    const DUTY_PERIOD: Duration = Duration::from_millis(10);
     let mut value = 0x9e37_79b9_7f4a_7c15_u64;
     while !stop.load(Ordering::Relaxed) {
-        for _ in 0..4096 {
-            value ^= value << 13;
-            value ^= value >> 7;
-            value ^= value << 17;
+        let cycle_start = Instant::now();
+        let busy_time = DUTY_PERIOD.mul_f64(f64::from(utilization) / 100.0);
+        let busy_until = cycle_start + busy_time;
+
+        while Instant::now() < busy_until && !stop.load(Ordering::Relaxed) {
+            // A data-dependent integer loop resists optimization. Checking the
+            // clock between small batches keeps low percentages responsive.
+            for _ in 0..256 {
+                value ^= value << 13;
+                value ^= value >> 7;
+                value ^= value << 17;
+            }
+            black_box(value);
         }
-        black_box(value);
+
+        if utilization < 100 {
+            thread::sleep((cycle_start + DUTY_PERIOD).saturating_duration_since(Instant::now()));
+        }
     }
 }
 

@@ -19,17 +19,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     args.validate()?;
 
-    let result = if args.visual {
-        visual::run(&args)?
-    } else {
-        workload::run(&args)?
-    };
+    let result = visual::run(&args)?;
     if let Some(path) = &args.output {
         save_csv(path, &result)?;
     }
 
     println!("\nConfiguration");
     println!("  CPU:                 {}", result.cpu);
+    println!("  CPU worker util:     {}%", args.cpu_util);
     println!("  frames:              {}", result.frame_latencies.len());
     println!(
         "  frame period:        {}",
@@ -55,9 +52,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         result.deadline_misses as f64 * 100.0 / result.frame_latencies.len().max(1) as f64
     );
 
-    if args.histogram {
-        stats::print_histogram("Frame latency histogram", &result.frame_latencies, 20);
-    }
+    stats::print_histogram("Frame latency histogram", &result.frame_latencies, 20);
 
     Ok(())
 }
