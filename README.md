@@ -51,8 +51,11 @@ the baseline overlaid in gray:
 ```
 
 The anti-aliased dashboard uses modern status cards for the frame, kernel mutex,
-pipe worker, and competing CPU task. Real wait events produce a short highlight
-so even fast proxy-assisted lock transitions remain visible. Separate,
+pipe worker, and competing CPU task. These boxes, their labels, and dependency
+connectors remain static. Only payload packets animate from the pipe worker back
+to the frame, and packet motion stops when frame completion stalls. A full-width
+red CPU-pressure banner spans all three workload nodes to show the
+always-runnable competitor sharing their CPU. Separate,
 deadline-scaled bars show average mutex-gate and pipe wait over a stable 500 ms
 window. A minimum-width marker keeps nonzero subpixel waits visible while the
 numeric value remains exact. The interactive chart

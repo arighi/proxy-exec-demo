@@ -25,8 +25,7 @@ const GREEN: Color32 = Color32::from_rgb(54, 211, 153);
 const RED: Color32 = Color32::from_rgb(251, 103, 117);
 
 struct Dashboard {
-    gate_flash_until: Instant,
-    pipe_flash_until: Instant,
+    data_flow_until: Instant,
     latencies: VecDeque<Duration>,
     comparison: Vec<Duration>,
     gate_wait: Duration,
@@ -50,8 +49,7 @@ impl Dashboard {
     fn new(comparison: Vec<Duration>, metrics_interval: Duration) -> Self {
         let now = Instant::now();
         Self {
-            gate_flash_until: now,
-            pipe_flash_until: now,
+            data_flow_until: now,
             latencies: VecDeque::with_capacity(180),
             comparison,
             gate_wait: Duration::ZERO,
@@ -74,18 +72,14 @@ impl Dashboard {
 
     fn apply(&mut self, event: VisualEvent) {
         match event {
-            VisualEvent::WaitingForGate => {
-                self.gate_flash_until = Instant::now() + Duration::from_millis(8);
-            }
-            VisualEvent::WaitingForPipe => {
-                self.pipe_flash_until = Instant::now() + Duration::from_millis(8);
-            }
+            VisualEvent::WaitingForGate | VisualEvent::WaitingForPipe => {}
             VisualEvent::FrameComplete {
                 latency,
                 gate_wait,
                 pipe_wait,
                 missed_deadline,
             } => {
+                self.data_flow_until = Instant::now() + Duration::from_millis(120);
                 self.missed = missed_deadline;
                 self.gate_wait_total_ns += gate_wait.as_nanos();
                 self.pipe_wait_total_ns += pipe_wait.as_nanos();
@@ -127,12 +121,8 @@ impl Dashboard {
         }
     }
 
-    fn gate_flash_active(&self) -> bool {
-        Instant::now() < self.gate_flash_until
-    }
-
-    fn pipe_flash_active(&self) -> bool {
-        Instant::now() < self.pipe_flash_until
+    fn data_flow_active(&self) -> bool {
+        Instant::now() < self.data_flow_until
     }
 }
 
@@ -237,36 +227,7 @@ impl VisualApp {
             );
         });
         ui.add_space(8.0);
-        ui.columns(4, |columns| {
-            status_card(
-                &mut columns[0],
-                "Frame thread",
-                "Waiting for dependency",
-                CYAN,
-                self.dashboard.gate_flash_active(),
-            );
-            status_card(
-                &mut columns[1],
-                "Kernel mutex",
-                "Shared file-position gate",
-                AMBER,
-                self.dashboard.gate_flash_active(),
-            );
-            status_card(
-                &mut columns[2],
-                "Pipe worker",
-                "Produces frame payload",
-                VIOLET,
-                self.dashboard.pipe_flash_active(),
-            );
-            status_card(
-                &mut columns[3],
-                "CPU pressure",
-                "Always runnable",
-                RED,
-                false,
-            );
-        });
+        flow_diagram(ui, &self.dashboard);
     }
 
     fn draw_wait_split(&self, ui: &mut egui::Ui) {
@@ -473,8 +434,8 @@ pub fn run(args: &Args) -> Result<RunResult, Box<dyn Error>> {
     let title = format!("proxy-demo · {}", args.label);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1180.0, 820.0])
-            .with_min_inner_size([980.0, 760.0]),
+            .with_inner_size([1200.0, 900.0])
+            .with_min_inner_size([1024.0, 840.0]),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
@@ -523,32 +484,144 @@ fn modern_panel(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
         .show(ui, content);
 }
 
-fn status_card(ui: &mut egui::Ui, title: &str, subtitle: &str, accent: Color32, active: bool) {
-    let fill = if active {
-        accent.gamma_multiply(0.22)
+fn flow_diagram(ui: &mut egui::Ui, dashboard: &Dashboard) {
+    let (canvas, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 190.0),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter_at(canvas);
+    painter.rect_filled(canvas, 16.0, PANEL);
+
+    let padding = 20.0;
+    let gap = 54.0;
+    let node_width = (canvas.width() - padding * 2.0 - gap * 2.0) / 3.0;
+    let node_top = canvas.top() + 52.0;
+    let node_height = 58.0;
+    let nodes: Vec<egui::Rect> = (0..3)
+        .map(|index| {
+            egui::Rect::from_min_size(
+                egui::pos2(
+                    canvas.left() + padding + index as f32 * (node_width + gap),
+                    node_top,
+                ),
+                egui::vec2(node_width, node_height),
+            )
+        })
+        .collect();
+
+    let time = ui.input(|input| input.time) as f32;
+
+    let cpu_rect = egui::Rect::from_min_max(
+        egui::pos2(nodes[0].left(), canvas.top() + 5.0),
+        egui::pos2(nodes[2].right(), canvas.top() + 37.0),
+    );
+    painter.rect_filled(cpu_rect, 10.0, RED);
+    painter.rect_filled(cpu_rect.shrink(1.5), 8.5, Color32::from_rgb(47, 25, 38));
+    painter.text(
+        cpu_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "CPU pressure thread",
+        egui::FontId::proportional(13.0),
+        TEXT,
+    );
+    for pair in nodes.windows(2) {
+        let start = egui::pos2(pair[0].right() + 7.0, pair[0].center().y);
+        let end = egui::pos2(pair[1].left() - 10.0, pair[1].center().y);
+        painter.line_segment([start, end], Stroke::new(2.0, BORDER));
+        arrow_right(&painter, end, BORDER);
+    }
+
+    let pipe_y = canvas.bottom() - 20.0;
+    let pipe_points = [
+        egui::pos2(nodes[2].center().x, nodes[2].bottom() + 4.0),
+        egui::pos2(nodes[2].center().x, pipe_y),
+        egui::pos2(nodes[0].center().x, pipe_y),
+        egui::pos2(nodes[0].center().x, nodes[0].bottom() + 4.0),
+    ];
+    let data_active = dashboard.data_flow_active();
+    let pipe_color = if data_active {
+        VIOLET
     } else {
-        PANEL
+        Color32::from_rgb(54, 62, 84)
     };
-    egui::Frame::new()
-        .fill(fill)
-        .stroke(Stroke::new(1.5, if active { accent } else { BORDER }))
-        .corner_radius(14.0)
-        .inner_margin(16.0)
-        .show(ui, |ui| {
-            ui.set_min_height(76.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("●").size(18.0).color(accent));
-                ui.label(RichText::new(title).size(17.0).color(TEXT).strong());
-            });
-            ui.add_space(6.0);
-            ui.label(RichText::new(subtitle).size(13.0).color(MUTED));
-            ui.label(
-                RichText::new(if active { "ACTIVE WAIT" } else { "READY" })
-                    .size(11.0)
-                    .color(if active { accent } else { MUTED })
-                    .strong(),
-            );
-        });
+    for segment in pipe_points.windows(2) {
+        painter.line_segment([segment[0], segment[1]], Stroke::new(3.0, pipe_color));
+    }
+    arrow_up(&painter, pipe_points[3], pipe_color);
+    painter.text(
+        egui::pos2(canvas.center().x, pipe_y - 8.0),
+        egui::Align2::CENTER_BOTTOM,
+        "PIPE PAYLOAD  ·  WORKER → FRAME",
+        egui::FontId::proportional(11.0),
+        if data_active { VIOLET } else { MUTED },
+    );
+    if data_active {
+        for index in 0..6 {
+            let progress = (time * 0.9 + index as f32 / 6.0).fract();
+            let position = point_on_path(&pipe_points, progress);
+            painter.circle_filled(position, 4.0, VIOLET);
+            painter.circle_filled(position, 1.7, TEXT);
+        }
+    }
+
+    draw_flow_node(&painter, nodes[0], "Frame thread", CYAN);
+    draw_flow_node(&painter, nodes[1], "Kernel mutex", AMBER);
+    draw_flow_node(&painter, nodes[2], "Pipe worker", VIOLET);
+}
+
+fn draw_flow_node(painter: &egui::Painter, rect: egui::Rect, title: &str, accent: Color32) {
+    let border = accent.gamma_multiply(0.65);
+    let fill = Color32::from_rgb(22, 30, 49);
+    painter.rect_filled(rect, 14.0, border);
+    painter.rect_filled(rect.shrink(1.5), 12.5, fill);
+    painter.circle_filled(egui::pos2(rect.left() + 20.0, rect.center().y), 5.0, accent);
+    painter.text(
+        egui::pos2(rect.left() + 34.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        title,
+        egui::FontId::proportional(17.0),
+        TEXT,
+    );
+}
+
+fn arrow_right(painter: &egui::Painter, tip: egui::Pos2, color: Color32) {
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            tip,
+            tip + egui::vec2(-8.0, -5.0),
+            tip + egui::vec2(-8.0, 5.0),
+        ],
+        color,
+        Stroke::NONE,
+    ));
+}
+
+fn arrow_up(painter: &egui::Painter, tip: egui::Pos2, color: Color32) {
+    painter.add(egui::Shape::convex_polygon(
+        vec![tip, tip + egui::vec2(-5.0, 8.0), tip + egui::vec2(5.0, 8.0)],
+        color,
+        Stroke::NONE,
+    ));
+}
+
+fn lerp(start: egui::Pos2, end: egui::Pos2, progress: f32) -> egui::Pos2 {
+    start + (end - start) * progress
+}
+
+fn point_on_path(points: &[egui::Pos2], progress: f32) -> egui::Pos2 {
+    let total: f32 = points
+        .windows(2)
+        .map(|pair| pair[0].distance(pair[1]))
+        .sum();
+    let mut remaining = total * progress;
+    for pair in points.windows(2) {
+        let length = pair[0].distance(pair[1]);
+        if remaining <= length {
+            return lerp(pair[0], pair[1], remaining / length.max(f32::EPSILON));
+        }
+        remaining -= length;
+    }
+    *points.last().expect("flow path is non-empty")
 }
 
 fn stat_card(ui: &mut egui::Ui, label: &str, value_ns: Option<f64>) {
