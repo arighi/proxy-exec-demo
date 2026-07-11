@@ -505,7 +505,7 @@ fn flow_diagram(ui: &mut egui::Ui, dashboard: &Dashboard, deadline: Duration) {
     painter.text(
         egui::pos2(cpu_rect.center().x, cpu_rect.center().y - 8.0),
         egui::Align2::CENTER_CENTER,
-        "CPU worker thread",
+        "CPU worker task",
         egui::FontId::proportional(17.0),
         TEXT,
     );
@@ -553,7 +553,7 @@ fn flow_diagram(ui: &mut egui::Ui, dashboard: &Dashboard, deadline: Duration) {
     draw_flow_node(
         &painter,
         nodes[0],
-        "Foreground thread",
+        "Foreground task",
         Some("HIGH PRIORITY · PERIODIC"),
         CYAN,
     );
@@ -575,7 +575,7 @@ fn flow_diagram(ui: &mut egui::Ui, dashboard: &Dashboard, deadline: Duration) {
     draw_flow_node(
         &painter,
         nodes[2],
-        "Background thread",
+        "Background task",
         Some("LOW PRIORITY"),
         VIOLET,
     );
