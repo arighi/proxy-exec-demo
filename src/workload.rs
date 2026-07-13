@@ -16,7 +16,7 @@ use crate::stats;
 use crate::timing::{now_ns, ns_to_duration, sleep_until};
 
 pub struct RunResult {
-    pub cpu: usize,
+    pub cpu: Option<usize>,
     pub frame_period: Duration,
     pub frame_latencies: Vec<Duration>,
     pub gate_waits: Vec<Duration>,
@@ -53,7 +53,7 @@ fn run_inner(
     visual_tx: Option<Sender<VisualEvent>>,
     stop: Arc<AtomicBool>,
 ) -> Result<RunResult, Box<dyn Error>> {
-    let cpu = select_cpu(args.cpu)?;
+    let cpu = resolve_workload_cpu(args)?;
     let period_ns = 1_000_000_000_u64 / args.fps as u64;
 
     let (frame_gate, worker_gate) = create_gate_file(args.lock_bytes)?;
@@ -143,6 +143,14 @@ pub(crate) fn select_cpu(requested: Option<usize>) -> Result<usize, Box<dyn Erro
         .ok_or_else(|| "the process has no allowed CPUs".into())
 }
 
+pub(crate) fn resolve_workload_cpu(args: &Args) -> Result<Option<usize>, Box<dyn Error>> {
+    if args.no_pin {
+        Ok(None)
+    } else {
+        select_cpu(args.cpu).map(Some)
+    }
+}
+
 pub(crate) fn pin_current_thread_away_from(
     workload_cpu: usize,
 ) -> Result<Option<usize>, Box<dyn Error>> {
@@ -159,6 +167,13 @@ fn pin_current_thread(cpu: usize) -> io::Result<()> {
     let mut set = CpuSet::new();
     set.set(cpu).map_err(io::Error::from)?;
     sched_setaffinity(Pid::from_raw(0), &set).map_err(io::Error::from)
+}
+
+fn apply_workload_affinity(cpu: Option<usize>) -> io::Result<()> {
+    match cpu {
+        Some(cpu) => pin_current_thread(cpu),
+        None => Ok(()),
+    }
 }
 
 fn create_gate_file(lock_bytes: usize) -> io::Result<(File, File)> {
@@ -195,12 +210,12 @@ fn create_gate_file(lock_bytes: usize) -> io::Result<(File, File)> {
 
 fn background_worker(
     mut gate: File,
-    cpu: usize,
+    cpu: Option<usize>,
     lock_bytes: usize,
     stop: Arc<AtomicBool>,
     start: Arc<Barrier>,
 ) -> io::Result<()> {
-    let affinity_result = pin_current_thread(cpu);
+    let affinity_result = apply_workload_affinity(cpu);
     let mut gate_buffer = vec![0_u8; lock_bytes];
     start.wait();
     affinity_result?;
@@ -215,14 +230,14 @@ fn background_worker(
 
 fn frame_loop(
     mut gate: File,
-    cpu: usize,
+    cpu: Option<usize>,
     period_ns: u64,
     stop: Arc<AtomicBool>,
     start: Arc<Barrier>,
     sample_tx: Option<Sender<FrameSample>>,
     visual_tx: Option<Sender<VisualEvent>>,
 ) -> io::Result<FrameResult> {
-    let affinity_result = pin_current_thread(cpu);
+    let affinity_result = apply_workload_affinity(cpu);
     let mut frame_latencies = Vec::new();
     let mut gate_waits = Vec::new();
     let mut deadline_misses = 0;
@@ -314,8 +329,8 @@ fn report_periodically(
     }
 }
 
-fn burn_cpu(cpu: usize, utilization: u8, stop: Arc<AtomicBool>, start: Arc<Barrier>) {
-    let affinity_result = pin_current_thread(cpu);
+fn burn_cpu(cpu: Option<usize>, utilization: u8, stop: Arc<AtomicBool>, start: Arc<Barrier>) {
+    let affinity_result = apply_workload_affinity(cpu);
     start.wait();
     if let Err(error) = affinity_result {
         eprintln!("CPU worker could not set affinity: {error}");

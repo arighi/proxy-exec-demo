@@ -16,6 +16,11 @@ pub struct Args {
     #[arg(long)]
     pub cpu: Option<usize>,
 
+    /// Do not pin workload threads to one CPU. Each thread instead inherits
+    /// the process's allowed CPU affinity mask.
+    #[arg(long, conflicts_with = "cpu")]
+    pub no_pin: bool,
+
     /// Target utilization of the CPU worker thread, as a percentage.
     #[arg(long, value_name = "PERCENT", default_value_t = 100)]
     pub cpu_util: u8,
@@ -63,7 +68,15 @@ mod tests {
         let args = Args::try_parse_from(["proxy-demo"]).unwrap();
 
         assert_eq!(args.cpu_util, 100);
+        assert!(!args.no_pin);
         assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn no_pin_conflicts_with_cpu() {
+        let result = Args::try_parse_from(["proxy-demo", "--no-pin", "--cpu", "1"]);
+
+        assert!(result.is_err());
     }
 
     #[test]

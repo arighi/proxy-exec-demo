@@ -25,7 +25,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     println!("\nConfiguration");
-    println!("  CPU:                 {}", result.cpu);
+    match result.cpu {
+        Some(cpu) => println!("  CPU affinity:        pinned to CPU {cpu}"),
+        None => println!("  CPU affinity:        unpinned (process allowed mask)"),
+    }
     println!("  CPU worker util:     {}%", args.cpu_util);
     println!("  frames:              {}", result.frame_latencies.len());
     println!(

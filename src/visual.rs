@@ -382,7 +382,7 @@ pub fn run(args: &Args) -> Result<RunResult, Box<dyn Error>> {
         .transpose()?
         .unwrap_or_default();
     let (visual_tx, visual_rx) = mpsc::channel();
-    let workload_cpu = workload::select_cpu(args.cpu)?;
+    let workload_cpu = workload::resolve_workload_cpu(args)?;
     let stop = Arc::new(AtomicBool::new(false));
     let worker_stop = Arc::clone(&stop);
     let worker_args = args.clone();
@@ -390,7 +390,9 @@ pub fn run(args: &Args) -> Result<RunResult, Box<dyn Error>> {
         workload::run_visual(&worker_args, visual_tx, worker_stop)
             .map_err(|error| error.to_string())
     });
-    let _visual_cpu = workload::pin_current_thread_away_from(workload_cpu)?;
+    let _visual_cpu = workload_cpu
+        .map(workload::pin_current_thread_away_from)
+        .transpose()?;
 
     let metrics_interval =
         (args.stats_interval != 0).then(|| Duration::from_secs(args.stats_interval));
